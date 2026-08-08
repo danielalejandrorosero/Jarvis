@@ -158,3 +158,44 @@ def test_execute_rejects_overly_long_url(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert result == "No puedo abrir esa URL: es demasiado larga."
     assert opened == []
+
+
+# --- _open_in_browser: fuerza Chrome, con fallback al default de Windows -------------------
+
+
+def test_open_in_browser_launches_chrome_via_subprocess_when_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pedido explícito del usuario: nunca Edge, siempre Chrome si está instalado — se lanza vía
+    `subprocess.Popen([chrome_path, url])`, sin shell, con la URL como argumento propio."""
+    launched: list[list[str]] = []
+
+    monkeypatch.setattr(
+        open_url_module, "_find_chrome_executable", lambda: r"C:\Chrome\chrome.exe"
+    )
+    monkeypatch.setattr(
+        open_url_module.subprocess, "Popen", lambda args: launched.append(args)
+    )
+
+    open_url_module._open_in_browser("https://www.youtube.com")
+
+    assert launched == [[r"C:\Chrome\chrome.exe", "https://www.youtube.com"]]
+
+
+def test_open_in_browser_falls_back_to_default_browser_when_chrome_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Si Chrome no está instalado en la máquina, no falla — degrada al navegador default de
+    Windows (`webbrowser.open`) en vez de dejar a JARVIS sin poder abrir nada."""
+    opened_via_default: list[str] = []
+
+    monkeypatch.setattr(open_url_module, "_find_chrome_executable", lambda: None)
+    monkeypatch.setattr(
+        open_url_module.webbrowser,
+        "open",
+        lambda url, new=0: opened_via_default.append(url),
+    )
+
+    open_url_module._open_in_browser("https://www.youtube.com")
+
+    assert opened_via_default == ["https://www.youtube.com"]

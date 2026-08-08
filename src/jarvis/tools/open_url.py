@@ -1,4 +1,8 @@
-"""Tool para abrir sitios web en el navegador por defecto (ADR-0005).
+"""Tool para abrir sitios web en el navegador (ADR-0005).
+
+Fuerza Chrome específicamente (pedido explícito del usuario: nunca Edge, aunque sea el navegador
+default de Windows en la máquina), con fallback al navegador default si Chrome no está instalado
+— ver `_find_chrome_executable`/`_open_in_browser`.
 
 Distinto de `jarvis.tools.search.SearchTool`: `SearchTool` busca en la web y devuelve texto para
 que el LLM lo lea en voz alta; este tool abre una URL *visualmente*, para que el usuario la mire
@@ -40,7 +44,9 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import subprocess
 import webbrowser
+import winreg
 from typing import Any, ClassVar
 from urllib.parse import urlsplit
 
@@ -53,6 +59,13 @@ MAX_URL_LENGTH = (
     2000  # generoso para query strings de búsqueda legítimas, ver docstring del módulo
 )
 _LOCALHOST_NAMES = frozenset({"localhost"})
+# Pedido explícito del usuario: siempre Chrome, nunca Edge — aunque Edge sea el navegador
+# default de Windows en esta máquina. Se busca vía el registro (App Paths), el mecanismo
+# estándar que usa el propio Windows para resolver "chrome.exe" sin asumir una ruta de
+# instalación fija (Program Files vs Program Files (x86), instalación por-máquina vs por-usuario).
+_CHROME_APP_PATHS_KEY = (
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"
+)
 
 _REJECTION_MESSAGE = "No puedo abrir esa URL: solo abro sitios web (http/https)."
 _HOST_REJECTION_MESSAGE = (
@@ -61,21 +74,43 @@ _HOST_REJECTION_MESSAGE = (
 _LENGTH_REJECTION_MESSAGE = "No puedo abrir esa URL: es demasiado larga."
 
 
-def _open_in_browser(url: str) -> None:
-    """Abrir `url` en el navegador por defecto. `webbrowser.open` es asíncrono/fire-and-forget
-    del lado del sistema operativo, igual que `os.startfile` en `open_app.py`: devuelve el
-    control apenas se invocó al navegador, sin esperar a que la página cargue ni confirmar que el
-    lanzamiento tuvo éxito — por eso `OpenUrlTool.execute()` nunca afirma que la página "se
-    abrió", solo que "se está abriendo". Función de nivel de módulo, monkeypatcheable por tests
-    (mismo patrón que `_launch_shortcut` en `open_app.py`) para que la suite nunca abra un
-    navegador real.
+def _find_chrome_executable() -> str | None:
+    """Ruta al ejecutable de Chrome, o `None` si no está instalado. Prueba primero la clave de
+    máquina (instalación para todos los usuarios) y después la de usuario actual — mismo orden
+    que usa Windows internamente al resolver `chrome.exe` para `ShellExecute`."""
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            with winreg.OpenKey(hive, _CHROME_APP_PATHS_KEY) as key:
+                return winreg.QueryValue(key, None)
+        except OSError:
+            continue
+    return None
 
-    `new=0` explícito (pedido del usuario): reusar una ventana del navegador ya abierta en vez
-    de forzar una nueva — es el default de `webbrowser.open`, pero se deja explícito para que no
-    se rompa sin querer en un refactor futuro. Como usa el navegador default de Windows (no una
-    instancia separada), ya usa la sesión/cuenta en la que el usuario esté logeado — no hay
-    "sesión propia" de JARVIS que pudiera divergir de eso.
+
+def _open_in_browser(url: str) -> None:
+    """Abrir `url` en Chrome específicamente (pedido del usuario: nunca Edge), con fallback al
+    navegador default de Windows si Chrome no está instalado en esta máquina.
+
+    Se lanza Chrome vía `subprocess.Popen` con `url` como argumento propio de la lista (no
+    interpolado en un string de shell) — a diferencia de registrar un `webbrowser.GenericBrowser`
+    con un comando tipo `"chrome.exe" %s`, que internamente pasa por `os.system` (un shell real);
+    con `Popen([chrome_path, url])` no hay shell de por medio, así que no hay riesgo de inyección
+    de comando aunque `url` viniera de una fuente no del todo confiable (ya validada de todos
+    modos por `_is_valid_web_url`/`_is_host_allowed` antes de llegar acá). Pasarle una URL a
+    Chrome como argumento reusa una ventana ya abierta (nueva pestaña) si Chrome ya está
+    corriendo, igual que `new=0` en `webbrowser.open`.
+
+    Fire-and-forget del lado del sistema operativo, igual que `os.startfile` en `open_app.py`:
+    devuelve el control apenas se lanzó el proceso, sin esperar a que la página cargue ni
+    confirmar éxito — por eso `OpenUrlTool.execute()` nunca afirma que la página "se abrió", solo
+    que "se está abriendo". Función de nivel de módulo, monkeypatcheable por tests (mismo patrón
+    que `_launch_shortcut` en `open_app.py`) para que la suite nunca abra un navegador real.
     """
+    chrome_path = _find_chrome_executable()
+    if chrome_path is not None:
+        subprocess.Popen([chrome_path, url])  # lista de args, sin shell=True
+        return
+    logger.warning("Chrome no encontrado, usando el navegador default de Windows.")
     webbrowser.open(url, new=0)
 
 
