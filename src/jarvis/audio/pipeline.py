@@ -1094,15 +1094,47 @@ def run(
             remaining = (deadline - time.monotonic()) if deadline is not None else None
             frames = iter_microphone_frames(device=device, duration=remaining)
             pre_roll_buffer: deque[np.ndarray] = deque(maxlen=PRE_ROLL_FRAMES)
-            hit = next(
-                detect(
-                    tee_frames(frames, pre_roll_buffer),
-                    model=wake_model,
-                    threshold=threshold,
-                    system_audio=system_audio,
-                ),
-                None,
-            )
+            try:
+                hit = next(
+                    detect(
+                        tee_frames(frames, pre_roll_buffer),
+                        model=wake_model,
+                        threshold=threshold,
+                        system_audio=system_audio,
+                    ),
+                    None,
+                )
+            except (sd.PortAudioError, OSError) as exc:
+                # Mismo principio que el except del turno más abajo (ver su comentario sobre el
+                # incidente en vivo del UnicodeEncodeError que tumbó el proceso entero) — acá es
+                # la MISMA clase de incidente pero en la otra mitad del loop: confirmado en vivo
+                # (`AUDCLNT_E_DEVICE_INVALIDATED`, PortAudioError -9999) que un dispositivo de
+                # entrada desconectado/invalidado a mitad de la ESPERA de la wake word (antes de
+                # detectar nada, no durante el procesamiento de un turno ya en curso) propagaba
+                # sin capturar hasta `main()` y mataba el proceso completo — el except de más
+                # abajo nunca corría porque el error pasa antes de siquiera entrar al loop
+                # interno. `sd.PortAudioError` (falla reportada por PortAudio/WASAPI, ej. device
+                # invalidado o desconectado en caliente) y `OSError` (mismo tipo de falla puede
+                # surgir como error de sistema según el modo exacto de falla) son las dos formas
+                # razonables en que esto se manifiesta — no `Exception` genérico como en el except
+                # de más abajo, porque acá sí sabemos qué esperar (falla de hardware/stream de
+                # audio, no cualquier error de LLM/tool/TTS).
+                #
+                # Recuperación: NO reintentar sobre el mismo stream (`frames`) — un device
+                # invalidado casi siempre necesita un stream nuevo, no un `read()` de nuevo sobre
+                # el mismo handle. `continue` vuelve al principio del `while`, donde
+                # `iter_microphone_frames()` se vuelve a llamar de cero más arriba, y
+                # `resolve_input_device()` (`jarvis.audio.device`, sin ningún caché — vuelve a
+                # consultar `sd.query_devices()`/`sd.default.device` en cada llamada) re-resuelve
+                # el device desde cero en la siguiente iteración: un stream realmente nuevo, no un
+                # reintento ciego sobre el mismo objeto roto. Un `COOLDOWN_SECONDS` fijo antes de
+                # reintentar evita spinnear el CPU en loop apretado si el device está
+                # permanentemente desconectado (mismo estilo que el resto de este módulo — nada de
+                # backoff exponencial ni jitter, sería sobre-ingeniería para este caso).
+                print(f"Error en el stream de escucha: {exc!r}", file=sys.stderr)
+                frames.close()
+                time.sleep(COOLDOWN_SECONDS)
+                continue
             frames.close()  # cierra el stream de escucha antes de abrir el de grabación
             if hit is None:
                 break  # se acabó la ventana de duration sin detectar nada más
