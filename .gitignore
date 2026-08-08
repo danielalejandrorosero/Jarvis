@@ -1,0 +1,41 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Windows ---
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.pfx
+secrets.*
+credentials.*
+
+# --- Claude Code: personal/local, never shared ---
+.claude/settings.local.json
+CLAUDE.local.md
+.claude/cache/
+
+# --- Editors ---
+.vscode/
+.idea/

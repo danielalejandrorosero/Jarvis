@@ -1,0 +1,77 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "PowerShell(git status:*)",
+      "PowerShell(git log:*)",
+      "PowerShell(git diff:*)",
+      "PowerShell(git branch:*)",
+      "PowerShell(git show:*)",
+      "PowerShell(Get-ChildItem:*)",
+      "PowerShell(Get-Content:*)",
+      "PowerShell(Test-Path:*)",
+      "PowerShell(python -m pytest:*)",
+      "PowerShell(ruff check:*)",
+      "PowerShell(ruff format:*)"
+    ],
+    "deny": [
+      "Read(**/.env)",
+      "Edit(**/.env)",
+      "Read(**/.env.local)",
+      "Edit(**/.env.local)",
+      "Read(**/.env.production)",
+      "Edit(**/.env.production)",
+      "Read(**/.env.development)",
+      "Edit(**/.env.development)",
+      "Read(**/.credentials.json)",
+      "Edit(**/.credentials.json)",
+      "Read(**/secrets.*)",
+      "Edit(**/secrets.*)",
+      "Read(**/*.pem)",
+      "Edit(**/*.pem)",
+      "Read(**/*.key)",
+      "Edit(**/*.key)",
+      "Read(**/*.pfx)",
+      "Edit(**/*.pfx)",
+      "Read(**/id_rsa*)",
+      "Edit(**/id_rsa*)",
+      "Read(**/id_ed25519*)",
+      "Edit(**/id_ed25519*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-dangerous-commands.ps1\""
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/protect-sensitive-files.ps1\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"$CLAUDE_PROJECT_DIR/.claude/hooks/python-format-on-save.ps1\""
+          }
+        ]
+      }
+    ]
+  }
+}
