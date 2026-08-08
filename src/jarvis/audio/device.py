@@ -77,3 +77,37 @@ def resolve_output_device(device: int | None) -> int:
 def output_sample_rate(device: int) -> int:
     """Sample rate nativo de un device de salida ya resuelto."""
     return int(sd.query_devices(device, kind="output")["default_samplerate"])
+
+
+# Palabras que Windows usa en los nombres de dispositivos de auriculares/headsets combinados
+# (entrada+salida en el mismo hardware físico) — en español y en inglés, porque el nombre exacto
+# depende del driver/fabricante, no solo del idioma de Windows.
+_HEADSET_NAME_KEYWORDS = ("auricular", "audífono", "headphone", "headset")
+
+
+def is_combined_headset(mic_device: int, output_device: int) -> bool:
+    """`True` si el mic y el device de salida resueltos parecen ser el mismo headset físico
+    (entrada y salida combinadas), a partir de que ambos nombres contienen una palabra de
+    auriculares/headset.
+
+    Por qué importa: `SystemAudioMonitor` (`jarvis.audio.loopback`) gatea la detección de wake
+    word contra "¿el sistema está sonando fuerte ahora mismo?" para evitar que audio de
+    juego/música que se *filtra al mic por el aire* (parlantes, un mic de PC abierto) dispare
+    falsos positivos o alucinaciones del STT — confirmado en vivo esta noche como el bug real.
+    Ese razonamiento no aplica a un headset: el audio de los auriculares suena adentro del oído,
+    no hay filtración acústica real hacia el mic del mismo headset (a diferencia de un parlante
+    de PC + mic abierto). Con el gate igual activo en ese caso, el umbral calibrado contra
+    audio de juego/música (~30-100 RMS) termina bloqueando también la voz real del usuario
+    mientras juega con auriculares puestos — confirmado en vivo esta misma noche: cero
+    detecciones de wake word mientras sonaba League of Legends por auriculares, con el usuario
+    diciendo "Alexa" activamente. Heurística por nombre, no por device ID: Windows expone el
+    mismo headset físico como device de entrada y de salida separados, con nombres relacionados
+    pero no necesariamente idénticos carácter a carácter (mismo problema de truncado MME que
+    `resolve_input_device`/`resolve_output_device` ya documentan) — comparar por palabra clave de
+    "auriculares/headset" presente en ambos es más robusto que comparar el nombre completo.
+    """
+    mic_name = str(sd.query_devices(mic_device)["name"]).lower()
+    output_name = str(sd.query_devices(output_device)["name"]).lower()
+    mic_is_headset = any(kw in mic_name for kw in _HEADSET_NAME_KEYWORDS)
+    output_is_headset = any(kw in output_name for kw in _HEADSET_NAME_KEYWORDS)
+    return mic_is_headset and output_is_headset

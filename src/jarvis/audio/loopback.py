@@ -165,22 +165,29 @@ class SystemAudioMonitor:
         device: int | None = None,
         threshold: float = DEFAULT_LOUDNESS_THRESHOLD,
         chunk_seconds: float = CHUNK_SECONDS,
+        enabled: bool = True,
     ) -> None:
         self._device = device
         self._threshold = threshold
         self._chunk_seconds = chunk_seconds
+        self._enabled = enabled
         self._level = 0.0
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        # Se pone en True si no hay device de salida o el stream de loopback no pudo abrirse
-        # (p.ej. conflicto de modo exclusivo) — desde ahí `is_loud()` siempre devuelve False en
-        # vez de tumbar JARVIS por una feature de robustez nice-to-have (ver docstring del
-        # módulo).
-        self._disabled = False
+        # Se pone en True si no hay device de salida, el stream de loopback no pudo abrirse
+        # (p.ej. conflicto de modo exclusivo), o si `enabled=False` (ver `device.is_combined_headset`
+        # — el gate no tiene sentido con un headset, donde no hay filtración acústica real del
+        # audio de salida hacia el mic) — desde ahí `is_loud()` siempre devuelve False en vez de
+        # tumbar JARVIS por una feature de robustez nice-to-have (ver docstring del módulo).
+        self._disabled = not enabled
 
     def start(self) -> None:
-        """Arrancar el thread de fondo. Idempotente: no hace nada si ya está corriendo."""
+        """Arrancar el thread de fondo. Idempotente: no hace nada si ya está corriendo. No-op
+        si `enabled=False` (ver `__init__`) — no tiene sentido abrir un stream de loopback que
+        `is_loud()` va a ignorar de todos modos."""
+        if not self._enabled:
+            return
         if self._thread is not None:
             return
         self._stop_event.clear()

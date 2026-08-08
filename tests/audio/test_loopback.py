@@ -38,6 +38,21 @@ def _poll_until(predicate: object, *, timeout: float = POLL_TIMEOUT_SECONDS) -> 
     return bool(predicate())  # type: ignore[operator]
 
 
+def test_enabled_false_disables_gate_without_starting_thread() -> None:
+    """`enabled=False` (usado por `pipeline.run()` cuando el mic y la salida son el mismo
+    headset combinado, ver `device.is_combined_headset`) deja `is_loud()` siempre `False` sin
+    abrir ningún stream real — confirma el bug en vivo de esta noche: con el gate activo de
+    más, un headset bloqueaba toda detección de wake word aunque el usuario hablara."""
+    monitor = SystemAudioMonitor(enabled=False)
+
+    monitor.start()
+
+    assert monitor.is_loud() is False
+    assert monitor._thread is None  # nunca se lanza el thread de fondo
+
+    monitor.stop()  # no-op, no debe lanzar aunque nunca haya arrancado
+
+
 def _float32_chunk_for_int16_level(
     level: float, *, frames: int = 100, channels: int = 1
 ) -> np.ndarray:
