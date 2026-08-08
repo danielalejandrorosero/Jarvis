@@ -82,7 +82,12 @@ from jarvis.tools.remember import RememberTool
 from jarvis.tools.search import WEB_DATA_CLOSE_TAG, WEB_DATA_OPEN_TAG, SearchTool
 from jarvis.tools.weather import WeatherTool
 
-COMMAND_WINDOW_SECONDS = 4.0  # tope duro: si nunca hay silencio, no graba para siempre
+COMMAND_WINDOW_SECONDS = 20.0  # tope duro: si nunca hay silencio, no graba para siempre
+# Antes en 4.0 — cortaba la grabación aunque el usuario siguiera hablando, no solo cuando
+# había silencio real (pedido explícito del usuario: "inteligente hasta que yo pare de hablar,
+# no solo 4 segundos"). El corte real sigue siendo por silencio sostenido
+# (`TRAILING_SILENCE_SECONDS`, ver `should_stop_recording`); este tope de 20s es solo la red de
+# seguridad para el caso de que el silencio nunca se detecte, no el comportamiento normal.
 COOLDOWN_SECONDS = (
     1.5  # evita que el eco de la grabación o repetir la frase retriggeree al toque
 )
