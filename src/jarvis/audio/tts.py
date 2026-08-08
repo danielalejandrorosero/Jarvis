@@ -20,10 +20,14 @@ from openai import OpenAI
 from playsound3 import playsound
 
 DEFAULT_OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
-DEFAULT_OPENAI_TTS_VOICE = (
-    "nova"  # voz femenina, cálida — OpenAI adapta el idioma automáticamente
-)
-# al texto de entrada (no hace falta un voice_id específico de español, a diferencia de edge-tts).
+# "nova" sonaba muy marcada al inglés en español (confirmado en vivo, pedido explícito del
+# usuario). "cedar" es una de las dos voces que OpenAI recomienda para casos donde la calidad
+# importa (la otra es "marin") y salió más rápida en la comparación en vivo (~6.9s vs ~8.9s de
+# marin con el mismo texto) — empate roto por velocidad, no hay forma de que yo "escuche" cuál
+# suena mejor.
+DEFAULT_OPENAI_TTS_VOICE = "cedar"
+# OpenAI adapta el idioma automáticamente al texto de entrada (no hace falta un voice_id
+# específico de español, a diferencia de edge-tts).
 
 
 class TTSClient(Protocol):
