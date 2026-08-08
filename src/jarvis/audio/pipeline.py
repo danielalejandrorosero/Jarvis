@@ -30,6 +30,7 @@ import sounddevice as sd
 from openai import OpenAI
 
 from jarvis.audio.device import input_sample_rate, resolve_input_device
+from jarvis.audio.loopback import SystemAudioGate, SystemAudioMonitor
 from jarvis.audio.resample import resample
 from jarvis.audio.stt import load_stt_client, transcribe
 from jarvis.audio.tts import TTSClient, load_default_tts_client
@@ -86,6 +87,11 @@ PRE_ROLL_SECONDS = (
 # (transcripciones truncadas tipo "Xim, ma, s, i, m" en vez de la frase completa). Guardar un
 # colchón de audio previo evita depender de que el usuario pause justo ahí.
 PRE_ROLL_FRAMES = max(1, round(PRE_ROLL_SECONDS * SAMPLE_RATE / FRAME_SAMPLES))
+TOOL_CALL_ACK_PHRASE = (
+    "Dale, dejame revisar eso."  # se dice antes de ejecutar un tool (clima,
+)
+# búsqueda web) porque la vuelta tarda unos segundos — sin este acuse quedaba en silencio y se
+# sentía como que JARVIS se había colgado (pedido explícito del usuario, confirmado en vivo).
 SYSTEM_PROMPT = (
     "Sos JARVIS, un asistente personal por voz. Respondés corto y directo, en español, porque "
     "tu respuesta se lee en voz alta — nada de listas, markdown, ni símbolos que no se puedan "
@@ -223,12 +229,28 @@ def should_stop_recording(
     return speech_started and silence_run_seconds >= TRAILING_SILENCE_SECONDS
 
 
+def is_speech_chunk(
+    rms: float, *, silence_threshold: float, system_is_loud: bool
+) -> bool:
+    """Decidir si un chunk cuenta como habla real: RMS del mic por encima del umbral de
+    silencio, Y el sistema no está sonando fuerte en ese instante.
+
+    AND-gate deliberado, no OR ni un reemplazo de `silence_threshold`: audio del sistema
+    (juego, música) filtrándose al mic puede subir su RMS por encima de `silence_threshold` sin
+    que el usuario esté hablando — mientras el sistema suena fuerte, ese chunk nunca cuenta como
+    habla, sin importar cuán alto esté el RMS del mic (`loopback.py`: no reemplaza cancelación
+    de eco real, es un gate binario aceptado como alcance reducido).
+    """
+    return rms >= silence_threshold and not system_is_loud
+
+
 def record_command(
     *,
     device: int | None,
     silence_threshold: float,
     max_duration: float = COMMAND_WINDOW_SECONDS,
     pre_roll: np.ndarray | None = None,
+    system_audio: SystemAudioGate | None = None,
 ) -> np.ndarray:
     """Grabar el comando dicho después de la wake word, cortando solo tras un silencio
     sostenido en vez de esperar siempre `max_duration` completos.
@@ -240,6 +262,13 @@ def record_command(
     `pre_roll`, si se pasa, se pega al principio del audio grabado — es el colchón de audio de
     justo antes de la wake word (ver `PRE_ROLL_FRAMES`), para no perder el arranque del comando
     si se habla pegado a la wake word sin pausa.
+
+    `system_audio`, si se pasa (`SystemAudioGate`, `jarvis.audio.loopback`), gatea qué cuenta
+    como habla: un chunk solo se considera voz si el RMS del mic cruza `silence_threshold` Y el
+    sistema no está sonando fuerte en ese instante — así el audio de un juego o música de fondo
+    filtrándose al mic no cuenta como "el usuario está hablando" (no reemplaza cancelación de
+    eco real, ver docstring de `loopback.py`). Sin `system_audio` (default `None`), idéntico al
+    comportamiento de antes de este parámetro.
     """
     resolved_device = resolve_input_device(device)
     device_sr = input_sample_rate(resolved_device)
@@ -262,7 +291,12 @@ def record_command(
             )
             chunks.append(chunk)
             elapsed += CHUNK_SECONDS
-            if chunk_rms(chunk) >= silence_threshold:
+            system_is_loud = system_audio is not None and system_audio.is_loud()
+            if is_speech_chunk(
+                chunk_rms(chunk),
+                silence_threshold=silence_threshold,
+                system_is_loud=system_is_loud,
+            ):
                 speech_started = True
                 silence_run = 0.0
             elif speech_started:
@@ -323,11 +357,13 @@ class VoiceConfirmationChannel:
         stt_client: OpenAI,
         device: int | None,
         silence_threshold: float,
+        system_audio: SystemAudioGate | None = None,
     ) -> None:
         self._tts = tts
         self._stt_client = stt_client
         self._device = device
         self._silence_threshold = silence_threshold
+        self._system_audio = system_audio
 
     async def ask(self, prompt: str) -> bool:
         # `tts.speak`/`record_command`/`transcribe` son bloqueantes (I/O de audio real) — se
@@ -339,6 +375,7 @@ class VoiceConfirmationChannel:
             record_command,
             device=self._device,
             silence_threshold=self._silence_threshold,
+            system_audio=self._system_audio,
         )
         text = await asyncio.to_thread(transcribe, audio, client=self._stt_client)
         print(f"(confirmación) Dijiste: {text!r}", file=sys.stderr)
@@ -374,6 +411,7 @@ def dispatch_turn(
     tools: dict[str, Tool],
     tool_schemas: list[ToolSchema],
     policy: PolicyEngine,
+    tts: TTSClient | None = None,
 ) -> str:
     """Un turno completo del planner bespoke de ADR-0005.
 
@@ -385,6 +423,12 @@ def dispatch_turn(
 
     `MAX_TOOL_CALLS_PER_TURN` es un tope duro: corta el turno si el LLM sigue pidiendo tools más
     allá de lo razonable, en vez de loopear indefinidamente.
+
+    Si se pasa `tts`, JARVIS dice una frase corta de acuse ("dejame revisar eso") apenas se
+    detecta un tool-call, antes de ejecutarlo — un tool real (clima, búsqueda web) tarda unos
+    segundos en volver, y sin esto quedaba en silencio todo ese tiempo, lo que se sentía como
+    que se había colgado. `tts=None` (el default) preserva el comportamiento silencioso para
+    quien llame a `dispatch_turn` sin audio (tests, u otros usos futuros no interactivos).
     """
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -396,6 +440,8 @@ def dispatch_turn(
             return result.text
         tool_call = result.tool_call
         messages.append(_assistant_message_for_tool_call(result))
+        if tool_call.arguments_error is None and tts is not None:
+            tts.speak(TOOL_CALL_ACK_PHRASE)
         if tool_call.arguments_error is not None:
             # Argumentos malformados (JSON inválido, o JSON válido pero no un objeto) — nunca
             # se llega a `PolicyEngine`/`Tool.execute` con esto; se le devuelve el error al LLM
@@ -433,6 +479,11 @@ def run(
     stt_client = load_stt_client()
     llm: LLMClient = load_deepseek_client_from_env()
     tts: TTSClient = load_default_tts_client()
+    # Un solo thread de fondo para toda la corrida (no uno por iteración del loop de escucha) —
+    # ver `loopback.py`: mide RMS de lo que reproduce el sistema para gatear falsos triggers de
+    # wake word y contaminación del audio del comando por sonido del propio PC.
+    system_audio = SystemAudioMonitor()
+    system_audio.start()
 
     tools: dict[str, Tool] = {tool.name: tool for tool in (WeatherTool(), SearchTool())}
     tool_schemas = [
@@ -454,6 +505,7 @@ def run(
         stt_client=stt_client,
         device=device,
         silence_threshold=silence_threshold,
+        system_audio=system_audio,
     )
     policy = PolicyEngine(confirmation)
 
@@ -472,6 +524,7 @@ def run(
                     tee_frames(frames, pre_roll_buffer),
                     model=wake_model,
                     threshold=threshold,
+                    system_audio=system_audio,
                 ),
                 None,
             )
@@ -486,7 +539,10 @@ def run(
                 np.concatenate(list(pre_roll_buffer)) if pre_roll_buffer else None
             )
             command_audio = record_command(
-                device=device, silence_threshold=silence_threshold, pre_roll=pre_roll
+                device=device,
+                silence_threshold=silence_threshold,
+                pre_roll=pre_roll,
+                system_audio=system_audio,
             )
             text = transcribe(command_audio, client=stt_client)
             print(f"Dijiste: {text!r}")
@@ -496,7 +552,12 @@ def run(
                 print("(nada que responder, no se detectó habla real)", file=sys.stderr)
             else:
                 reply = dispatch_turn(
-                    text, llm=llm, tools=tools, tool_schemas=tool_schemas, policy=policy
+                    text,
+                    llm=llm,
+                    tools=tools,
+                    tool_schemas=tool_schemas,
+                    policy=policy,
+                    tts=tts,
                 )
                 print(f"JARVIS: {reply}")
                 if reply.strip():
@@ -504,6 +565,8 @@ def run(
             time.sleep(COOLDOWN_SECONDS)
     except KeyboardInterrupt:
         print("Detenido.", file=sys.stderr)
+    finally:
+        system_audio.stop()
     print("Fin de la escucha.", file=sys.stderr)
 
 

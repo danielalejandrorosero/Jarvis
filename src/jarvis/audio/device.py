@@ -45,3 +45,35 @@ def resolve_input_device(device: int | None) -> int:
 def input_sample_rate(device: int) -> int:
     """Sample rate nativo de un device de entrada ya resuelto."""
     return int(sd.query_devices(device, kind="input")["default_samplerate"])
+
+
+def resolve_output_device(device: int | None) -> int:
+    """Resolver el índice de device de salida a usar (para loopback WASAPI, ver
+    `jarvis.audio.loopback`). Mismo enfoque que `resolve_input_device`: si se pide uno explícito
+    se respeta tal cual; si no, se busca la variante WASAPI del device de salida default en vez
+    de confiar en el default crudo de sounddevice — loopback WASAPI necesita abrirse contra ese
+    endpoint específico, no contra cualquier alias del mismo hardware.
+    """
+    if device is not None:
+        return device
+    default_index = sd.default.device[1]
+    if default_index is None:
+        raise RuntimeError(
+            "No hay dispositivo de salida de audio default configurado en Windows."
+        )
+    default_name = sd.query_devices(default_index)["name"]
+    for i, info in enumerate(sd.query_devices()):
+        if info["max_output_channels"] == 0:
+            continue
+        # Mismo truncado de nombres por MME que `resolve_input_device` — ver su comentario.
+        name = info["name"]
+        if not (name.startswith(default_name) or default_name.startswith(name)):
+            continue
+        if sd.query_hostapis(info["hostapi"])["name"] == "Windows WASAPI":
+            return i
+    return int(default_index)
+
+
+def output_sample_rate(device: int) -> int:
+    """Sample rate nativo de un device de salida ya resuelto."""
+    return int(sd.query_devices(device, kind="output")["default_samplerate"])

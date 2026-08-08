@@ -33,11 +33,13 @@ from jarvis.audio.pipeline import (
     TRAILING_SILENCE_SECONDS,
     calibrate_thresholds,
     chunk_rms,
+    is_speech_chunk,
     measure_noise_floor,
     normalize_gain,
     should_stop_recording,
     tee_frames,
 )
+from jarvis.audio.tts import TTSClient
 from jarvis.llm.client import LLMResult, ToolCall
 from jarvis.security.policy import PolicyEngine
 from jarvis.tools.base import RiskLevel, Tool
@@ -147,6 +149,31 @@ def test_normalize_gain_leaves_below_min_peak_audio_unchanged() -> None:
     result = normalize_gain(audio, min_peak=40.0)
 
     assert np.array_equal(result, audio)
+
+
+# --- is_speech_chunk (AND-gate contra audio fuerte del sistema, ver `loopback.py`) -----------
+
+
+def test_is_speech_chunk_true_when_rms_crosses_threshold_and_system_is_quiet() -> None:
+    assert is_speech_chunk(100.0, silence_threshold=50.0, system_is_loud=False) is True
+
+
+def test_is_speech_chunk_false_when_rms_below_threshold_even_if_system_is_quiet() -> (
+    None
+):
+    assert is_speech_chunk(10.0, silence_threshold=50.0, system_is_loud=False) is False
+
+
+def test_is_speech_chunk_false_when_system_is_loud_even_if_rms_crosses_threshold() -> (
+    None
+):
+    """El caso que motiva el gate: un RMS de mic alto por sí solo no alcanza si viene de audio
+    del sistema (juego, música) filtrándose al mic, no del usuario hablando."""
+    assert is_speech_chunk(9000.0, silence_threshold=50.0, system_is_loud=True) is False
+
+
+def test_is_speech_chunk_false_when_both_rms_low_and_system_loud() -> None:
+    assert is_speech_chunk(5.0, silence_threshold=50.0, system_is_loud=True) is False
 
 
 # --- should_stop_recording -------------------------------------------------------------------
@@ -415,6 +442,67 @@ def test_dispatch_turn_executes_tool_via_policy_and_returns_final_llm_text() -> 
     tool_message = llm.calls[1][-1]
     assert tool_message["role"] == "tool"
     assert tool_message["content"] == "clima de Madrid: soleado"
+
+
+def test_dispatch_turn_speaks_ack_phrase_before_executing_a_valid_tool_call() -> None:
+    """Pedido explícito del usuario: un tool real tarda unos segundos en volver, y sin acuse
+    hablado JARVIS quedaba en silencio ese rato — se sentía como colgado. Si se pasa `tts`,
+    `dispatch_turn` dice `TOOL_CALL_ACK_PHRASE` antes de autorizar/ejecutar el tool-call."""
+    tool = _StubTool()
+    good_call = ToolCall(id="call_1", name="get_weather", arguments={"city": "Madrid"})
+    llm = _ScriptedLLMClient(
+        [
+            LLMResult(text="", tool_call=good_call),
+            LLMResult(text="En Madrid está soleado.", tool_call=None),
+        ]
+    )
+
+    class _AlwaysDenyChannel:
+        async def ask(self, prompt: str) -> bool:
+            return False
+
+    policy = PolicyEngine(_AlwaysDenyChannel())
+    tts = MagicMock(spec=TTSClient)
+
+    pipeline.dispatch_turn(
+        "clima en Madrid",
+        llm=llm,
+        tools={tool.name: tool},
+        tool_schemas=[],
+        policy=policy,
+        tts=tts,
+    )
+
+    tts.speak.assert_called_once_with(pipeline.TOOL_CALL_ACK_PHRASE)
+
+
+def test_dispatch_turn_without_tts_never_speaks_anything() -> None:
+    """`tts=None` (el default) preserva el comportamiento silencioso — no debe fallar ni intentar
+    hablar nada."""
+    tool = _StubTool()
+    good_call = ToolCall(id="call_1", name="get_weather", arguments={"city": "Madrid"})
+    llm = _ScriptedLLMClient(
+        [
+            LLMResult(text="", tool_call=good_call),
+            LLMResult(text="En Madrid está soleado.", tool_call=None),
+        ]
+    )
+
+    class _AlwaysDenyChannel:
+        async def ask(self, prompt: str) -> bool:
+            return False
+
+    policy = PolicyEngine(_AlwaysDenyChannel())
+
+    reply = pipeline.dispatch_turn(
+        "clima en Madrid",
+        llm=llm,
+        tools={tool.name: tool},
+        tool_schemas=[],
+        policy=policy,
+    )
+
+    assert reply == "En Madrid está soleado."
 
 
 def test_dispatch_turn_feeds_arguments_error_back_to_llm_without_calling_policy() -> (

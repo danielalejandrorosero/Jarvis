@@ -17,6 +17,7 @@ import sounddevice as sd
 from openwakeword.model import Model
 
 from jarvis.audio.device import input_sample_rate, resolve_input_device
+from jarvis.audio.loopback import SystemAudioGate
 from jarvis.audio.resample import fit_frame, resample
 
 SAMPLE_RATE = 16_000
@@ -95,10 +96,24 @@ def detect(
     *,
     model: Model,
     threshold: float = DEFAULT_THRESHOLD,
+    system_audio: SystemAudioGate | None = None,
 ) -> Iterator[Detection]:
-    """Consumir frames de audio y emitir una Detection cada vez que se cruza el umbral."""
+    """Consumir frames de audio y emitir una Detection cada vez que se cruza el umbral.
+
+    `system_audio`, si se pasa, es una inyección de dependencia opcional (`SystemAudioGate`,
+    `jarvis.audio.loopback`): mientras reporte `is_loud() == True`, no se emite Detection en ese
+    frame aunque el score cruce el umbral — evita falsos triggers por audio fuerte del sistema
+    (juego, música) filtrándose al mic (no reemplaza cancelación de eco real, ver docstring de
+    `loopback.py`). Se sigue llamando a `model.predict()` en cada frame sin importar el gate:
+    openWakeWord mantiene una ventana deslizante de estado interno entre llamadas, así que
+    saltear frames enteros rompería las predicciones siguientes en vez de solo silenciarlas.
+    Sin `system_audio` (default `None`, como en todos los tests existentes), el comportamiento
+    es idéntico al de antes de este parámetro.
+    """
     for frame in frames:
         predictions = model.predict(frame)
+        if system_audio is not None and system_audio.is_loud():
+            continue
         for wakeword, score in predictions.items():
             if score >= threshold:
                 yield Detection(

@@ -117,3 +117,73 @@ def test_detect_on_empty_frame_stream_yields_nothing() -> None:
     hits = list(detect(frames, model=model, threshold=0.5))
 
     assert hits == []
+
+
+# --- system_audio (gate de falsos triggers por audio fuerte del sistema, ver `loopback.py`) --
+
+
+class _FakeSystemAudioGate:
+    """Stub de `loopback.SystemAudioGate`: `is_loud()` devuelve un valor fijo, sin abrir ningún
+    stream real — cumple el contrato mínimo que `detect()` necesita."""
+
+    def __init__(self, *, loud: bool) -> None:
+        self._loud = loud
+
+    def is_loud(self) -> bool:
+        return self._loud
+
+
+def test_detect_suppresses_detection_while_system_audio_is_loud() -> None:
+    """Un score que normalmente cruzaría el umbral no produce Detection mientras
+    `system_audio.is_loud()` sea True — el caso central de este cambio."""
+    frames = _silence_frames(1)
+    model = _model_with([{"hey_jarvis": 0.9}])
+
+    hits = list(
+        detect(
+            frames,
+            model=model,
+            threshold=0.5,
+            system_audio=_FakeSystemAudioGate(loud=True),
+        )
+    )
+
+    assert hits == []
+
+
+def test_detect_still_yields_detection_when_system_audio_is_not_loud() -> None:
+    """Con el gate presente pero `is_loud() == False`, el comportamiento es el de siempre."""
+    frames = _silence_frames(1)
+    model = _model_with([{"hey_jarvis": 0.9}])
+
+    hits = list(
+        detect(
+            frames,
+            model=model,
+            threshold=0.5,
+            system_audio=_FakeSystemAudioGate(loud=False),
+        )
+    )
+
+    assert len(hits) == 1
+    assert hits[0].score == 0.9
+
+
+def test_detect_calls_predict_even_on_frames_suppressed_by_system_audio() -> None:
+    """`model.predict()` se llama en cada frame sin importar el gate: openWakeWord mantiene
+    estado interno entre llamadas, así que saltear la llamada rompería las predicciones
+    siguientes (ver docstring de `detect`). Un `_FakeModel` con menos predicciones que frames
+    haría `StopIteration` si `predict()` no se llamara para el frame gateado."""
+    frames = _silence_frames(2)
+    model = _model_with([{"hey_jarvis": 0.9}, {"hey_jarvis": 0.9}])
+
+    hits = list(
+        detect(
+            frames,
+            model=model,
+            threshold=0.5,
+            system_audio=_FakeSystemAudioGate(loud=True),
+        )
+    )
+
+    assert hits == []
