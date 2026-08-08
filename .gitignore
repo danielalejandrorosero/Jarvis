@@ -39,3 +39,6 @@ CLAUDE.local.md
 # --- Editors ---
 .vscode/
 .idea/
+
+# --- Datos en tiempo de ejecución (memoria SQLite de JARVIS, ADR-0004) ---
+data/
