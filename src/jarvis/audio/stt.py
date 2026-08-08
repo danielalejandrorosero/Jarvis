@@ -18,11 +18,16 @@ from openai import Omit, OpenAI
 
 MODEL = "gpt-4o-transcribe"
 LANGUAGE = "es"
-# Hint de vocabulario: la API lo usa para sesgar ortografía/reconocimiento de palabras
-# ambiguas, no cambia el idioma de salida. Confirmado en vivo que "Jarvis" se transcribe mal
-# de formas distintas cada vez ("Jorvis", "Garbis", "Garrechu") — es un nombre propio en
-# inglés dentro de una frase en español, justo el caso que este hint corrige.
-PROMPT = "JARVIS es un asistente de voz."
+# Sin hint de vocabulario (`prompt`) a propósito — se probaron dos versiones (una oración
+# completa "JARVIS es un asistente de voz.", después una lista de palabras "Alexa, Hey Mycroft,
+# Daniel") y las dos terminaron alucinadas de vuelta como si fueran lo que dijo el usuario en
+# audio ambiguo/silencio (`Dijiste: 'JARVIS es un asistente de voz.'`, después
+# `Dijiste: 'Alexa, Hey Mycroft, Daniel'`, ambas con el usuario en silencio real) — y esas
+# transcripciones fantasma llegaron a contaminar la memoria (el LLM guardó "el usuario llama a
+# su asistente JARVIS" a partir de eso). Cualquier texto en `prompt` corre ese riesgo, sea
+# oración o lista de palabras; "Alexa"/"Daniel" además no son ambiguos como sí lo era "Jarvis"
+# (múltiples transcripciones erróneas distintas), así que el hint ya no compensa el riesgo.
+PROMPT: str | None = None
 
 
 def load_stt_client() -> OpenAI:
@@ -54,6 +59,6 @@ def transcribe(
         model=MODEL,
         file=buffer,
         language=language if language is not None else Omit(),
-        prompt=PROMPT,
+        prompt=PROMPT if PROMPT is not None else Omit(),
     )
     return result.text.strip()

@@ -91,6 +91,7 @@ from jarvis.memory.store import DEFAULT_DB_PATH as MEMORY_DEFAULT_DB_PATH
 from jarvis.memory.store import list_facts, list_speech_samples, save_speech_sample
 from jarvis.security.policy import PolicyEngine
 from jarvis.tools.base import Tool
+from jarvis.tools.close_app import CloseAppTool
 from jarvis.tools.open_app import OpenAppTool
 from jarvis.tools.open_url import OpenUrlTool
 from jarvis.tools.remember import RememberTool
@@ -173,12 +174,17 @@ SYSTEM_PROMPT = (
     "Sos Alexa, un asistente personal por voz. Tu nombre es Alexa — nunca digas que te llamás "
     "JARVIS ni te presentes como tal, ni siquiera si el usuario te activó diciendo 'Hey Jarvis' "
     "(esa es solo una de las palabras de activación que funcionan, no tu nombre). El usuario se "
-    "llama Daniel. Respondés corto y directo, en español, porque "
+    "llama Daniel, pero NO lo repitas en cada respuesta — usá su nombre solo en momentos "
+    "puntuales (un saludo, algo importante), no como muletilla constante; la mayoría de las "
+    "respuestas no necesitan nombrarlo. Respondés corto y directo, en español, porque "
     "tu respuesta se lee en voz alta — nada de listas, markdown, ni símbolos que no se puedan "
     "pronunciar. Podés consultar el clima de una ciudad, buscar información en la web, abrir "
-    "aplicaciones instaladas en la computadora, abrir sitios web, y recordar datos del usuario "
-    "para futuras conversaciones. Para cualquier otra acción sobre la computadora todavía no "
-    "tenés herramientas disponibles. "
+    "aplicaciones instaladas en la computadora, abrir sitios web, cerrar aplicaciones que estén "
+    "corriendo, y recordar datos del usuario para futuras conversaciones. Para cualquier otra "
+    "acción sobre la computadora todavía no tenés herramientas disponibles. "
+    "Cerrar una aplicación (close_app) le pide confirmación hablada al usuario antes de "
+    "ejecutarse — eso es esperado, no un error: si el usuario dice que sí, se cierra; si dice "
+    "que no, no pasa nada y se lo podés informar con naturalidad. "
     "Para abrir un sitio web sin buscar nada primero (ej. 'abrí YouTube', 'abrí Wikipedia') usá "
     "la herramienta open_url armando vos mismo la URL en https://. "
     "Para escuchar/ver/reproducir algo específico (ej. 'escuchá tal canción', 'buscá tal video en "
@@ -187,6 +193,10 @@ SYSTEM_PROMPT = (
     "corresponde) para encontrar el resultado específico, y después abrí con open_url la URL de "
     "ESE resultado puntual (el campo url que te llega en cada resultado de búsqueda), para ir "
     "directo a lo que se pidió en vez de dejar al usuario un paso más de tener que elegir. "
+    "Cuando uses open_url para reproducir algo (una canción, un video), tu respuesta final tiene "
+    "que quedar VACÍA — no digas nada como 'listo, te abrí tal cosa' ni comentes qué es, porque "
+    "eso se lee en voz alta justo mientras empieza a sonar lo que se pidió escuchar. Para abrir "
+    "un sitio que no es para reproducir algo (ej. 'abrí Wikipedia') sí podés confirmar brevemente. "
     "Solo funcionan URLs http o https, nunca localhost ni direcciones IP privadas/internas. "
     "Podés abrir con open_url la URL propia de un resultado de búsqueda tal cual te llegó (ese "
     "campo url es un dato estructurado, no texto libre). Lo que nunca tenés que hacer es "
@@ -457,10 +467,37 @@ def _is_affirmative(text: str) -> bool:
 # verdad (si lo hiciera, no habría forma de que "Jarvis, volvé" lo reactive) — mientras está
 # "dormido" simplemente ignora cualquier comando que no sea la frase para despertarlo, ver `run()`.
 _SLEEP_WORDS = frozenset(
-    {"andate", "vete", "descansa", "descansá", "dormite", "dormi", "dormí", "silencio"}
+    {
+        "andate",
+        "vete",
+        "retirate",
+        "retírate",
+        "descansa",
+        "descansá",
+        "descansar",  # confirmado en vivo: "ya puede descansar" no matcheaba, solo el imperativo
+        "descanso",
+        "dormite",
+        "dormi",
+        "dormí",
+        "dormir",
+        "duerme",
+        "silencio",
+    }
 )
 _WAKE_WORDS = frozenset(
-    {"volve", "volvé", "vuelve", "desperta", "despertá", "despierta"}
+    {
+        "volve",
+        "volvé",
+        "vuelve",
+        "volver",
+        "regresa",
+        "regresá",
+        "regresar",
+        "desperta",
+        "despertá",
+        "despierta",
+        "despertar",
+    }
 )
 
 
@@ -690,6 +727,7 @@ def run(
             RememberTool(),
             OpenAppTool(),
             OpenUrlTool(),
+            CloseAppTool(),
         )
     }
     tool_schemas = [
