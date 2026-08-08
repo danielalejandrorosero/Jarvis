@@ -728,6 +728,19 @@ def run(
 
     Corre hasta Ctrl+C, o hasta que pasen `duration` segundos totales si se especifica.
     """
+    # Crítico, no cosmético: corriendo sin consola (arranque automático vía pythonw.exe +
+    # Tarea Programada), stdout/stderr redirigidos a archivo usan el codepage ANSI de Windows
+    # (cp1252) por default, no UTF-8. Confirmado en vivo que eso tumbaba el proceso ENTERO —
+    # `print(f"Dijiste: {text!r}")` con una tilde en el texto transcripto lanzaba
+    # `UnicodeEncodeError` sin capturar, matando el loop de escucha completo (JARVIS dejaba de
+    # responder hasta el próximo reinicio manual). `errors="replace"` como red de seguridad
+    # adicional: aunque aparezca algún carácter que ni UTF-8 pueda manejar por algún motivo,
+    # se reemplaza en vez de crashear.
+    for stream in (sys.stdout, sys.stderr):
+        # `.reconfigure()` es de `io.TextIOWrapper`, no del tipo estático `TextIO` que expone
+        # el stub de `sys` — existe en runtime (stdout/stderr son `TextIOWrapper` de verdad),
+        # mypy no lo sabe.
+        stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     load_dotenv()
     wake_model = load_wake_word_model()
     stt_client = load_stt_client()
@@ -805,55 +818,66 @@ def run(
                 f"Wake word detectada (score={hit.score:.2f}). Escuchando comando...",
                 file=sys.stderr,
             )
-            pre_roll = (
-                np.concatenate(list(pre_roll_buffer)) if pre_roll_buffer else None
-            )
-            command_audio = record_command(
-                device=device,
-                silence_threshold=silence_threshold,
-                pre_roll=pre_roll,
-                system_audio=system_audio,
-            )
-            text = transcribe(command_audio, client=stt_client)
-            print(f"Dijiste: {text!r}")
-            if text.strip():
-                # Log automático, sin juicio del LLM (a diferencia de `remember_fact`): toda
-                # transcripción real se guarda como muestra de estilo de habla, sin importar si
-                # después resulta ser un comando para dormir/despertar o algo que dispatch_turn
-                # no puede resolver — aprender CÓMO habla el usuario es ortogonal a QUÉ pidió en
-                # este turno puntual (ver docstring del módulo).
-                save_speech_sample(text, db_path=MEMORY_DEFAULT_DB_PATH)
-            if not text.strip():
-                # El modelo de transcripción puede devolver vacío sobre silencio puro; no tiene
-                # sentido gastar una llamada al LLM sobre texto vacío.
-                print("(nada que responder, no se detectó habla real)", file=sys.stderr)
-            elif sleeping:
-                if _contains_any_word(text, _WAKE_WORDS):
-                    sleeping = False
-                    wake_reply = "Volví. ¿En qué te ayudo?"
-                    print(f"JARVIS: {wake_reply}")
-                    tts.speak(wake_reply)
+            try:
+                pre_roll = (
+                    np.concatenate(list(pre_roll_buffer)) if pre_roll_buffer else None
+                )
+                command_audio = record_command(
+                    device=device,
+                    silence_threshold=silence_threshold,
+                    pre_roll=pre_roll,
+                    system_audio=system_audio,
+                )
+                text = transcribe(command_audio, client=stt_client)
+                print(f"Dijiste: {text!r}")
+                if text.strip():
+                    # Log automático, sin juicio del LLM (a diferencia de `remember_fact`): toda
+                    # transcripción real se guarda como muestra de estilo de habla, sin importar
+                    # si después resulta ser un comando para dormir/despertar o algo que
+                    # dispatch_turn no puede resolver — aprender CÓMO habla el usuario es
+                    # ortogonal a QUÉ pidió en este turno puntual (ver docstring del módulo).
+                    save_speech_sample(text, db_path=MEMORY_DEFAULT_DB_PATH)
+                if not text.strip():
+                    # El modelo de transcripción puede devolver vacío sobre silencio puro; no
+                    # tiene sentido gastar una llamada al LLM sobre texto vacío.
+                    print(
+                        "(nada que responder, no se detectó habla real)",
+                        file=sys.stderr,
+                    )
+                elif sleeping:
+                    if _contains_any_word(text, _WAKE_WORDS):
+                        sleeping = False
+                        wake_reply = "Volví. ¿En qué te ayudo?"
+                        print(f"JARVIS: {wake_reply}")
+                        tts.speak(wake_reply)
+                    else:
+                        print("(dormido, ignorando)", file=sys.stderr)
+                elif _contains_any_word(text, _SLEEP_WORDS):
+                    sleeping = True
+                    sleep_reply = (
+                        'Listo, descanso. Decime "Alexa, volvé" cuando me necesites.'
+                    )
+                    print(f"JARVIS: {sleep_reply}")
+                    tts.speak(sleep_reply)
                 else:
-                    print("(dormido, ignorando)", file=sys.stderr)
-            elif _contains_any_word(text, _SLEEP_WORDS):
-                sleeping = True
-                sleep_reply = (
-                    'Listo, descanso. Decime "Alexa, volvé" cuando me necesites.'
-                )
-                print(f"JARVIS: {sleep_reply}")
-                tts.speak(sleep_reply)
-            else:
-                reply = dispatch_turn(
-                    text,
-                    llm=llm,
-                    tools=tools,
-                    tool_schemas=tool_schemas,
-                    policy=policy,
-                    tts=tts,
-                )
-                print(f"JARVIS: {reply}")
-                if reply.strip():
-                    tts.speak(reply)
+                    reply = dispatch_turn(
+                        text,
+                        llm=llm,
+                        tools=tools,
+                        tool_schemas=tool_schemas,
+                        policy=policy,
+                        tts=tts,
+                    )
+                    print(f"JARVIS: {reply}")
+                    if reply.strip():
+                        tts.speak(reply)
+            except Exception as exc:  # noqa: BLE001 — última línea de defensa del turno: un
+                # error inesperado en STT/LLM/tool/TTS de un turno puntual no tiene que tumbar
+                # el proceso entero (pedido implícito por el incidente en vivo: un
+                # UnicodeEncodeError en un print() mató el loop completo y JARVIS dejó de
+                # responder hasta el próximo reinicio manual — este turno se pierde, pero el
+                # siguiente "Hey Jarvis"/"Alexa" sigue funcionando en vez de silencio total).
+                print(f"Error procesando el turno: {exc!r}", file=sys.stderr)
             time.sleep(COOLDOWN_SECONDS)
     except KeyboardInterrupt:
         print("Detenido.", file=sys.stderr)
