@@ -10,11 +10,20 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Iterator
 from typing import cast
+from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 from openwakeword.model import Model
 
-from jarvis.audio.wake_word import FRAME_SAMPLES, Detection, detect
+from jarvis.audio import wake_word
+from jarvis.audio.wake_word import (
+    FRAME_SAMPLES,
+    WAKEWORD_NAMES,
+    Detection,
+    detect,
+    load_model,
+)
 
 
 class _FakeModel:
@@ -36,6 +45,24 @@ def _model_with(predictions: list[dict[str, float]]) -> Model:
     # El stub no implementa la superficie completa de Model, solo lo que `detect()` usa
     # (`.predict()`). Se castea para satisfacer la firma de `detect(..., model: Model)`.
     return cast(Model, _FakeModel(predictions))
+
+
+# --- load_model (no descarga ni carga modelos reales: Model se mockea) ------------------------
+
+
+def test_load_model_passes_all_wakeword_names_to_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`load_model()` debe pedirle a openWakeWord los tres modelos de `WAKEWORD_NAMES` a la vez,
+    no solo el primario — es lo que hace que cualquiera de las tres frases dispare a JARVIS."""
+    mock_model_cls = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(wake_word, "Model", mock_model_cls)
+
+    load_model()
+
+    mock_model_cls.assert_called_once_with(
+        wakeword_models=WAKEWORD_NAMES, inference_framework="onnx"
+    )
 
 
 def test_detect_yields_detection_when_score_crosses_threshold() -> None:

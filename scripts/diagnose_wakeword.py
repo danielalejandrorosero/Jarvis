@@ -6,19 +6,29 @@ import sys
 
 sys.path.insert(0, "src")
 
-from jarvis.audio.wake_word import WAKEWORD_NAME, iter_microphone_frames, load_model  # noqa: E402
+from jarvis.audio.wake_word import (  # noqa: E402
+    WAKEWORD_NAMES,
+    iter_microphone_frames,
+    load_model,
+)
 
 DURATION = float(sys.argv[1]) if len(sys.argv) > 1 else 15.0
 DEVICE = int(sys.argv[2]) if len(sys.argv) > 2 else None
+# Wakeword a diagnosticar: la primaria por default, o la que se pase como 3er argumento
+# (útil para calibrar "alexa"/"hey_mycroft" individualmente más adelante).
+TARGET_WAKEWORD = sys.argv[3] if len(sys.argv) > 3 else WAKEWORD_NAMES[0]
 
 model = load_model()
 frames = iter_microphone_frames(device=DEVICE, duration=DURATION)
 max_score = 0.0
 scores_over_time = []
-print(f"Escuchando {DURATION}s (device={DEVICE})... decí 'Hey Jarvis'", file=sys.stderr)
+print(
+    f"Escuchando {DURATION}s (device={DEVICE})... decí '{TARGET_WAKEWORD}'",
+    file=sys.stderr,
+)
 for frame in frames:
     predictions = model.predict(frame)
-    score = predictions.get(WAKEWORD_NAME, 0.0)
+    score = predictions.get(TARGET_WAKEWORD, 0.0)
     scores_over_time.append(score)
     if score > max_score:
         max_score = score

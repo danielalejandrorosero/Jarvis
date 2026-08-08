@@ -1,4 +1,5 @@
-"""Prototipo de detección de wake word ("Hey Jarvis") sobre el micrófono real.
+"""Prototipo de detección de wake word ("Hey Jarvis", "Alexa", "Hey Mycroft") sobre el
+micrófono real.
 
 Alcance de esta fase: solo detección. Nada de STT, LLM ni TTS todavía (ADR-0004).
 """
@@ -22,7 +23,14 @@ from jarvis.audio.resample import fit_frame, resample
 
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1280  # 80ms a 16kHz: tamaño de chunk recomendado por openWakeWord
-WAKEWORD_NAME = "hey_jarvis"
+
+# "hey_jarvis" primero/primario: es el único calibrado en vivo (ver DEFAULT_THRESHOLD abajo).
+# "alexa" y "hey_mycroft" son modelos pretrained adicionales de openWakeWord (sin entrenar nada
+# custom — eso queda para una fase futura con Python 3.10 + deps viejas + GPU), agregados para
+# que cualquiera de las tres frases dispare a JARVIS. `Model(wakeword_models=[...])` con varias
+# entradas hace que `model.predict()` devuelva un dict keyed por wakeword, y `detect()` ya itera
+# ese dict (`predictions.items()`), así que no necesitó cambios para soportar múltiples wakewords.
+WAKEWORD_NAMES = ["hey_jarvis", "alexa", "hey_mycroft"]
 
 # Calibrado empíricamente (fase 1 y recalibrado en fase 4, docs/decisions/), no elegido al azar.
 # Con el modelo pretrained "hey_jarvis", el score varía sesión a sesión: fase 1 llegó a 0.4916
@@ -33,6 +41,9 @@ WAKEWORD_NAME = "hey_jarvis"
 # (ADR-0004). Si en una fase futura se ata una acción real a esto, revisar este valor junto con
 # el contrato de confirmación verbal (silencio/ambigüedad = denegar), y considerar entrenar un
 # modelo de wake word con la voz real del usuario en vez de seguir bajando el umbral genérico.
+# "alexa" y "hey_mycroft" reusan este mismo umbral por ahora: no fueron calibrados individualmente
+# en vivo todavía, así que puede que necesiten su propio valor más adelante (más falsos positivos
+# o negativos que "hey_jarvis" con este mismo threshold no está descartado).
 DEFAULT_THRESHOLD = 0.25
 
 
@@ -46,8 +57,9 @@ class Detection:
 
 
 def load_model() -> Model:
-    """Cargar el modelo hey_jarvis. Requiere haber corrido download_models() al menos una vez."""
-    return Model(wakeword_models=[WAKEWORD_NAME], inference_framework="onnx")
+    """Cargar los modelos de `WAKEWORD_NAMES`. Requiere haber corrido
+    `openwakeword.utils.download_models(WAKEWORD_NAMES)` al menos una vez."""
+    return Model(wakeword_models=WAKEWORD_NAMES, inference_framework="onnx")
 
 
 def iter_microphone_frames(
@@ -136,7 +148,8 @@ def run(
     model = load_model()
     frames = iter_microphone_frames(device=device, duration=duration)
     print(
-        f"Escuchando... decí 'Hey Jarvis' (Ctrl+C para salir, umbral={threshold})",
+        "Escuchando... decí 'Hey Jarvis', 'Alexa' o 'Hey Mycroft' "
+        f"(Ctrl+C para salir, umbral={threshold})",
         file=sys.stderr,
     )
     try:
