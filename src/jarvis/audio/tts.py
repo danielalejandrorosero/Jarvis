@@ -1,25 +1,29 @@
 """Texto a voz detrás de una interfaz swappable (ADR-0004).
 
-Primario: `edge-tts` (calidad neural, voz "es-CO-SalomeNeural" — femenina, español colombiano,
-pedido explícito del usuario al renombrar la identidad hablada a "Alexa") — usa un endpoint no
-oficial de Microsoft, funcional y gratis pero puede romperse o bloquearse sin aviso porque no es
-una API soportada. Fallback local obligatorio: SAPI vía `pyttsx3`, siempre disponible en Windows,
-sin red — JARVIS nunca queda mudo por depender de algo externo.
+Primario: API de OpenAI (`gpt-4o-mini-tts`) — mismo proveedor que ya usamos para STT (misma
+`OPENAI_API_KEY`, sin cuenta nueva). Reemplaza a `edge-tts` (medido en vivo: generación de
+~8.7s en una respuesta corta, el cuello de botella real de latencia de todo el pipeline —
+`edge-tts` es un endpoint no oficial de Microsoft, sin garantía de rendimiento). Fallback local
+obligatorio: SAPI vía `pyttsx3`, siempre disponible en Windows, sin red — JARVIS nunca queda
+mudo por depender de algo externo, sea cual sea el primario.
 """
 
 from __future__ import annotations
 
-import asyncio
 import sys
 import tempfile
 from pathlib import Path
 from typing import Protocol
 
-import edge_tts
 import pyttsx3
+from openai import OpenAI
 from playsound3 import playsound
 
-DEFAULT_EDGE_VOICE = "es-CO-SalomeNeural"
+DEFAULT_OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
+DEFAULT_OPENAI_TTS_VOICE = (
+    "nova"  # voz femenina, cálida — OpenAI adapta el idioma automáticamente
+)
+# al texto de entrada (no hace falta un voice_id específico de español, a diferencia de edge-tts).
 
 
 class TTSClient(Protocol):
@@ -28,17 +32,27 @@ class TTSClient(Protocol):
         ...
 
 
-class EdgeTTSClient:
-    """Primario: voz neural vía `edge-tts`."""
+class OpenAITTSClient:
+    """Primario: voz neural vía la API de OpenAI."""
 
-    def __init__(self, *, voice: str = DEFAULT_EDGE_VOICE) -> None:
+    def __init__(
+        self,
+        *,
+        client: OpenAI | None = None,
+        model: str = DEFAULT_OPENAI_TTS_MODEL,
+        voice: str = DEFAULT_OPENAI_TTS_VOICE,
+    ) -> None:
+        self._client = client if client is not None else OpenAI()
+        self._model = model
         self._voice = voice
 
     def speak(self, text: str) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out_path = Path(tmp) / "speech.mp3"
-            communicate = edge_tts.Communicate(text, voice=self._voice)
-            asyncio.run(communicate.save(str(out_path)))
+            with self._client.audio.speech.with_streaming_response.create(
+                model=self._model, voice=self._voice, input=text
+            ) as response:
+                response.stream_to_file(str(out_path))
             playsound(str(out_path))
 
 
@@ -76,5 +90,5 @@ class FallbackTTSClient:
 
 
 def load_default_tts_client() -> TTSClient:
-    """Cliente TTS con el contrato de ADR-0004: edge-tts primario, SAPI de fallback."""
-    return FallbackTTSClient(primary=EdgeTTSClient(), fallback=SapiTTSClient())
+    """Cliente TTS con el contrato de ADR-0004: OpenAI TTS primario, SAPI de fallback."""
+    return FallbackTTSClient(primary=OpenAITTSClient(), fallback=SapiTTSClient())

@@ -1,15 +1,16 @@
 """Tests para `FallbackTTSClient.speak()` (la capa de recuperación de ADR-0004).
 
-`EdgeTTSClient` y `SapiTTSClient` pegan contra red/hardware de audio real y no son testeables
-como unit test (requieren un endpoint no oficial de Microsoft y/o SAPI real). Lo que sí es
-testeable, y el punto central de este módulo, es `FallbackTTSClient`: primario y fallback se
-reemplazan por stubs controlados por el test, así que corre rápido, sin red y sin reproducir
-audio (CI-safe). `load_default_tts_client()` no se invoca: construiría clientes reales.
+`OpenAITTSClient` y `SapiTTSClient` pegan contra red/hardware de audio real y no son testeables
+como unit test (requieren la API de OpenAI y/o SAPI real). Lo que sí es testeable, y el punto
+central de este módulo, es `FallbackTTSClient`: primario y fallback se reemplazan por stubs
+controlados por el test, así que corre rápido, sin red y sin reproducir audio (CI-safe).
 """
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock
+
+import pytest
 
 from jarvis.audio.tts import FallbackTTSClient, TTSClient, load_default_tts_client
 
@@ -98,10 +99,16 @@ def test_speak_does_not_call_fallback_when_fallback_would_also_fail_but_primary_
     fallback.speak.assert_not_called()
 
 
-def test_load_default_tts_client_returns_a_fallback_tts_client() -> None:
-    """`load_default_tts_client()` arma un `FallbackTTSClient` real (edge-tts + SAPI), pero el
-    test no invoca `.speak()` sobre él: construir las instancias es barato (sin I/O), llamarlas
-    no lo es."""
+def test_load_default_tts_client_returns_a_fallback_tts_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`load_default_tts_client()` arma un `FallbackTTSClient` real (OpenAI TTS + SAPI), pero el
+    test no invoca `.speak()` sobre él: construir las instancias es barato (sin I/O más allá de
+    que el SDK de OpenAI exige una API key *presente* para instanciar el cliente, no que sea
+    válida — `monkeypatch.setenv` alcanza, no hace falta una key real ni red), llamarlas no lo
+    es."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-real")
+
     client = load_default_tts_client()
 
     assert isinstance(client, FallbackTTSClient)

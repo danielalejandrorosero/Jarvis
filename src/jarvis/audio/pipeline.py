@@ -681,8 +681,8 @@ def dispatch_turn(
     demora en ejecutar cosas"). `SYSTEM_PROMPT` instruye explícitamente al LLM a encadenar
     `search_web` + `open_url` para pedidos tipo "poné tal canción en YouTube" — eso son 2-3
     iteraciones de este loop en un solo turno, y antes de este fix cada una volvía a decir la
-    frase de acuse entera (con su propio round-trip de red a `edge-tts` y reproducción, ver
-    `EdgeTTSClient.speak` en `jarvis.audio.tts` — no es gratis, es bloqueante), así que el usuario
+    frase de acuse entera (con su propio round-trip de red al TTS y reproducción, ver
+    `OpenAITTSClient.speak` en `jarvis.audio.tts` — no es gratis, es bloqueante), así que el usuario
     escuchaba "Dale, dejame revisar eso." repetido 2-3 veces seguidas Y esa repetición sumaba
     varios segundos reales de latencia extra encima de las llamadas al LLM/tools en sí. Una sola
     vez alcanza para el propósito original (avisar que no se colgó); repetirla no aporta nada
