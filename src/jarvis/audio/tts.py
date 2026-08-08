@@ -21,11 +21,13 @@ from playsound3 import playsound
 
 DEFAULT_OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
 # "nova" sonaba muy marcada al inglés en español (confirmado en vivo, pedido explícito del
-# usuario). "cedar" es una de las dos voces que OpenAI recomienda para casos donde la calidad
-# importa (la otra es "marin") y salió más rápida en la comparación en vivo (~6.9s vs ~8.9s de
-# marin con el mismo texto) — empate roto por velocidad, no hay forma de que yo "escuche" cuál
-# suena mejor.
-DEFAULT_OPENAI_TTS_VOICE = "cedar"
+# usuario). Se probó "cedar" (una de las voces que OpenAI recomienda por calidad) pero resultó
+# sonar masculina — el usuario pidió explícitamente una voz femenina. "shimmer" es, junto con
+# "nova", una de las dos voces que toda la documentación confirma como femenina (las voces
+# nuevas — marin/cedar/coral/sage/ash/ballad/verse — no tienen género documentado en ningún
+# lado, no vale la pena arriesgar otra adivinanza); confirmada en vivo con el usuario que suena
+# femenina y menos marcada al inglés que nova.
+DEFAULT_OPENAI_TTS_VOICE = "shimmer"
 # OpenAI adapta el idioma automáticamente al texto de entrada (no hace falta un voice_id
 # específico de español, a diferencia de edge-tts).
 
