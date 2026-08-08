@@ -107,6 +107,15 @@ COMMAND_WINDOW_SECONDS = 20.0  # tope duro: si nunca hay silencio, no graba para
 COOLDOWN_SECONDS = (
     1.5  # evita que el eco de la grabación o repetir la frase retriggeree al toque
 )
+FOLLOW_UP_WINDOW_SECONDS = (
+    8.0  # tope de grabación para un comando de seguimiento, sin wake
+)
+# word. Pedido explícito del usuario: después de un comando real ("Alexa, abrí YouTube"), poder
+# seguir hablando sin repetir "Alexa" cada vez ("ahora reproducí esto"). El corte real, igual que
+# en un comando normal, sigue siendo por silencio sostenido (`TRAILING_SILENCE_SECONDS`) — este
+# tope es solo la red de seguridad para el caso de seguimiento, más corta que
+# `COMMAND_WINDOW_SECONDS` porque acá además hace de límite de "cuánto esperar antes de asumir
+# que no hay seguimiento y volver a pedir la wake word".
 AGC_TARGET_PEAK_RATIO = 0.9  # a qué % del rango de int16 apuntamos al subir volumen
 CHUNK_SECONDS = (
     0.2  # tamaño de chunk para detectar silencio mientras se graba el comando
@@ -849,74 +858,97 @@ def run(
                 f"Wake word detectada (score={hit.score:.2f}). Escuchando comando...",
                 file=sys.stderr,
             )
-            try:
-                pre_roll = (
-                    np.concatenate(list(pre_roll_buffer)) if pre_roll_buffer else None
-                )
-                command_audio, speech_detected = record_command(
-                    device=device,
-                    silence_threshold=silence_threshold,
-                    pre_roll=pre_roll,
-                    system_audio=system_audio,
-                )
-                if not speech_detected:
-                    # Nunca cruzó el umbral de silencio — no hay audio real que transcribir.
-                    # No llamar a transcribe() acá es la mitigación real contra la cascada de
-                    # alucinaciones vista en vivo (texto random en otros idiomas sobre silencio
-                    # puro), no solo un ahorro de una llamada de red.
-                    text = ""
-                else:
-                    text = transcribe(command_audio, client=stt_client)
-                print(f"Dijiste: {text!r}")
-                if text.strip():
-                    # Log automático, sin juicio del LLM (a diferencia de `remember_fact`): toda
-                    # transcripción real se guarda como muestra de estilo de habla, sin importar
-                    # si después resulta ser un comando para dormir/despertar o algo que
-                    # dispatch_turn no puede resolver — aprender CÓMO habla el usuario es
-                    # ortogonal a QUÉ pidió en este turno puntual (ver docstring del módulo).
-                    save_speech_sample(text, db_path=MEMORY_DEFAULT_DB_PATH)
-                if not text.strip():
-                    # El modelo de transcripción puede devolver vacío sobre silencio puro; no
-                    # tiene sentido gastar una llamada al LLM sobre texto vacío.
-                    print(
-                        "(nada que responder, no se detectó habla real)",
-                        file=sys.stderr,
+            # Después de un comando real (no dormir/despertar), se escucha una ventana corta de
+            # seguimiento sin volver a pedir la wake word — pedido explícito del usuario: "Alexa,
+            # abrí YouTube" y después, sin decir "Alexa" de nuevo, "ahora reproducí esto". Si no
+            # hay nada en esa ventana, se vuelve a exigir la wake word normalmente.
+            awaiting_wake_word = False
+            first_listen = True
+            while not awaiting_wake_word:
+                try:
+                    pre_roll = (
+                        np.concatenate(list(pre_roll_buffer))
+                        if first_listen and pre_roll_buffer
+                        else None
                     )
-                elif sleeping:
-                    if _contains_any_word(text, _WAKE_WORDS):
-                        sleeping = False
-                        wake_reply = "Volví. ¿En qué te ayudo?"
-                        print(f"JARVIS: {wake_reply}")
-                        tts.speak(wake_reply)
+                    max_duration = (
+                        COMMAND_WINDOW_SECONDS
+                        if first_listen
+                        else FOLLOW_UP_WINDOW_SECONDS
+                    )
+                    first_listen = False
+                    command_audio, speech_detected = record_command(
+                        device=device,
+                        silence_threshold=silence_threshold,
+                        max_duration=max_duration,
+                        pre_roll=pre_roll,
+                        system_audio=system_audio,
+                    )
+                    if not speech_detected:
+                        # Nunca cruzó el umbral de silencio — no hay audio real que transcribir.
+                        # No llamar a transcribe() acá es la mitigación real contra la cascada de
+                        # alucinaciones vista en vivo (texto random en otros idiomas sobre
+                        # silencio puro), no solo un ahorro de una llamada de red.
+                        text = ""
                     else:
-                        print("(dormido, ignorando)", file=sys.stderr)
-                elif _contains_any_word(text, _SLEEP_WORDS):
-                    sleeping = True
-                    sleep_reply = (
-                        'Listo, descanso. Decime "Alexa, volvé" cuando me necesites.'
-                    )
-                    print(f"JARVIS: {sleep_reply}")
-                    tts.speak(sleep_reply)
-                else:
-                    reply = dispatch_turn(
-                        text,
-                        llm=llm,
-                        tools=tools,
-                        tool_schemas=tool_schemas,
-                        policy=policy,
-                        tts=tts,
-                    )
-                    print(f"JARVIS: {reply}")
-                    if reply.strip():
-                        tts.speak(reply)
-            except Exception as exc:  # noqa: BLE001 — última línea de defensa del turno: un
-                # error inesperado en STT/LLM/tool/TTS de un turno puntual no tiene que tumbar
-                # el proceso entero (pedido implícito por el incidente en vivo: un
-                # UnicodeEncodeError en un print() mató el loop completo y JARVIS dejó de
-                # responder hasta el próximo reinicio manual — este turno se pierde, pero el
-                # siguiente "Hey Jarvis"/"Alexa" sigue funcionando en vez de silencio total).
-                print(f"Error procesando el turno: {exc!r}", file=sys.stderr)
-            time.sleep(COOLDOWN_SECONDS)
+                        text = transcribe(command_audio, client=stt_client)
+                    print(f"Dijiste: {text!r}")
+                    if text.strip():
+                        # Log automático, sin juicio del LLM (a diferencia de `remember_fact`):
+                        # toda transcripción real se guarda como muestra de estilo de habla, sin
+                        # importar si después resulta ser un comando para dormir/despertar o algo
+                        # que dispatch_turn no puede resolver — aprender CÓMO habla el usuario es
+                        # ortogonal a QUÉ pidió en este turno puntual (ver docstring del módulo).
+                        save_speech_sample(text, db_path=MEMORY_DEFAULT_DB_PATH)
+                    if not text.strip():
+                        # Silencio real (sin habla, o la ventana de seguimiento se agotó) — se
+                        # acaba la ventana de seguimiento y se vuelve a pedir la wake word.
+                        print(
+                            "(nada que responder, no se detectó habla real)",
+                            file=sys.stderr,
+                        )
+                        awaiting_wake_word = True
+                    elif sleeping:
+                        if _contains_any_word(text, _WAKE_WORDS):
+                            sleeping = False
+                            wake_reply = "Volví. ¿En qué te ayudo?"
+                            print(f"JARVIS: {wake_reply}")
+                            tts.speak(wake_reply)
+                        else:
+                            print("(dormido, ignorando)", file=sys.stderr)
+                        awaiting_wake_word = (
+                            True  # dormir/despertar no abre ventana de seguimiento
+                        )
+                    elif _contains_any_word(text, _SLEEP_WORDS):
+                        sleeping = True
+                        sleep_reply = 'Listo, descanso. Decime "Alexa, volvé" cuando me necesites.'
+                        print(f"JARVIS: {sleep_reply}")
+                        tts.speak(sleep_reply)
+                        awaiting_wake_word = True
+                    else:
+                        reply = dispatch_turn(
+                            text,
+                            llm=llm,
+                            tools=tools,
+                            tool_schemas=tool_schemas,
+                            policy=policy,
+                            tts=tts,
+                        )
+                        print(f"JARVIS: {reply}")
+                        if reply.strip():
+                            tts.speak(reply)
+                        awaiting_wake_word = (
+                            False  # comando real -> abrir ventana de seguimiento
+                        )
+                except Exception as exc:  # noqa: BLE001 — última línea de defensa del turno: un
+                    # error inesperado en STT/LLM/tool/TTS de un turno puntual no tiene que
+                    # tumbar el proceso entero (pedido implícito por el incidente en vivo: un
+                    # UnicodeEncodeError en un print() mató el loop completo y JARVIS dejó de
+                    # responder hasta el próximo reinicio manual — este turno se pierde, pero el
+                    # siguiente "Hey Jarvis"/"Alexa" sigue funcionando en vez de silencio total).
+                    print(f"Error procesando el turno: {exc!r}", file=sys.stderr)
+                    awaiting_wake_word = True
+                time.sleep(COOLDOWN_SECONDS)
     except KeyboardInterrupt:
         print("Detenido.", file=sys.stderr)
     finally:
