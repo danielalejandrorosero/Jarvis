@@ -1,7 +1,8 @@
-"""Pipeline integrado: wake word → grabar comando → transcribir.
+"""Pipeline integrado: wake word → grabar comando → transcribir → responder con el LLM.
 
-Alcance de esta fase: detectar + transcribir lo que se dijo después de la wake word. Nada de
-LLM ni TTS todavía — el texto transcripto solo se imprime por consola (ADR-0004).
+Alcance de esta fase: detectar + transcribir + una respuesta de texto del LLM (DeepSeek). Nada
+de TTS todavía — la respuesta solo se imprime por consola (ADR-0004). Sin tools ni acciones
+reales: el LLM solo conversa, no ejecuta nada sobre el sistema (esa capa es la próxima fase).
 """
 
 from __future__ import annotations
@@ -21,8 +22,17 @@ from jarvis.audio.wake_word import (
     iter_microphone_frames,
 )
 from jarvis.audio.wake_word import load_model as load_wake_word_model
+from jarvis.config import load_dotenv
+from jarvis.llm.client import LLMClient, load_deepseek_client_from_env
 
 COMMAND_WINDOW_SECONDS = 4.0
+COOLDOWN_SECONDS = 1.5  # evita que el eco de la grabación o repetir la frase retriggeree al toque
+SYSTEM_PROMPT = (
+    "Sos JARVIS, un asistente personal por voz. Respondés corto y directo, en español, "
+    "porque tu respuesta se va a leer en una consola por ahora — nada de listas largas ni "
+    "formato markdown. Todavía no podés ejecutar ninguna acción real sobre la computadora, "
+    "solo conversar."
+)
 
 
 def record_command(*, device: int | None, duration: float = COMMAND_WINDOW_SECONDS) -> np.ndarray:
@@ -54,8 +64,10 @@ def run(
     pip `nvidia-cublas-cu12`/`nvidia-cudnn-cu12`. Si no están instalados o la GPU falla, pasar
     `--stt-device cpu` explícitamente.
     """
+    load_dotenv()
     wake_model = load_wake_word_model()
     whisper_model = load_whisper_model(device=stt_device)
+    llm: LLMClient = load_deepseek_client_from_env()
     deadline = time.monotonic() + duration if duration is not None else None
     print(
         f"Escuchando... decí 'Hey Jarvis' (Ctrl+C para salir, umbral={threshold})",
@@ -76,6 +88,14 @@ def run(
             command_audio = record_command(device=device)
             text = transcribe(command_audio, model=whisper_model)
             print(f"Dijiste: {text!r}")
+            if not text.strip():
+                # Whisper puede "alucinar" frases sobre silencio puro (confirmado en esta fase);
+                # no tiene sentido gastar una llamada al LLM sobre texto vacío.
+                print("(nada que responder, no se detectó habla real)", file=sys.stderr)
+            else:
+                reply = llm.complete(text, system=SYSTEM_PROMPT)
+                print(f"JARVIS: {reply}")
+            time.sleep(COOLDOWN_SECONDS)
     except KeyboardInterrupt:
         print("Detenido.", file=sys.stderr)
     print("Fin de la escucha.", file=sys.stderr)
