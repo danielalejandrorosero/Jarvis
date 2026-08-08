@@ -24,13 +24,16 @@ from jarvis.audio.resample import fit_frame, resample
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1280  # 80ms a 16kHz: tamaño de chunk recomendado por openWakeWord
 
-# "hey_jarvis" primero/primario: es el único calibrado en vivo (ver DEFAULT_THRESHOLD abajo).
-# "alexa" y "hey_mycroft" son modelos pretrained adicionales de openWakeWord (sin entrenar nada
-# custom — eso queda para una fase futura con Python 3.10 + deps viejas + GPU), agregados para
-# que cualquiera de las tres frases dispare a JARVIS. `Model(wakeword_models=[...])` con varias
-# entradas hace que `model.predict()` devuelva un dict keyed por wakeword, y `detect()` ya itera
-# ese dict (`predictions.items()`), así que no necesitó cambios para soportar múltiples wakewords.
-WAKEWORD_NAMES = ["hey_jarvis", "alexa", "hey_mycroft"]
+# "alexa" primero/primaria (pedido explícito del usuario). "hey_jarvis" y "hey_mycroft" son
+# modelos pretrained adicionales de openWakeWord (sin entrenar nada custom — eso queda para una
+# fase futura con Python 3.10 + deps viejas + GPU), agregados para que cualquiera de las tres
+# frases dispare a JARVIS. `Model(wakeword_models=[...])` con varias entradas hace que
+# `model.predict()` devuelva un dict keyed por wakeword, y `detect()` ya itera ese dict
+# (`predictions.items()`), así que no necesitó cambios para soportar múltiples wakewords. Las
+# tres comparten `DEFAULT_THRESHOLD` (calibrado en vivo solo contra "hey_jarvis" — ver abajo);
+# "alexa" no tiene calibración propia todavía, si en el uso real resulta muy sensible o muy poco
+# sensible hay que ajustarla con `scripts/diagnose_wakeword.py`.
+WAKEWORD_NAMES = ["alexa", "hey_jarvis", "hey_mycroft"]
 
 # Calibrado empíricamente (fase 1 y recalibrado en fase 4, docs/decisions/), no elegido al azar.
 # Con el modelo pretrained "hey_jarvis", el score varía sesión a sesión: fase 1 llegó a 0.4916

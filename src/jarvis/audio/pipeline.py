@@ -667,7 +667,7 @@ def run(
     deadline = time.monotonic() + duration if duration is not None else None
     sleeping = False
     print(
-        "Escuchando... decí 'Hey Jarvis', 'Alexa' o 'Hey Mycroft' "
+        "Escuchando... decí 'Alexa', 'Hey Jarvis' o 'Hey Mycroft' "
         f"(Ctrl+C para salir, umbral={threshold})",
         file=sys.stderr,
     )
