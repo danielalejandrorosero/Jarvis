@@ -1,9 +1,10 @@
 """Texto a voz detrás de una interfaz swappable (ADR-0004).
 
-Primario: `edge-tts` (calidad neural, voz "es-AR-TomasNeural") — usa un endpoint no oficial de
-Microsoft, funcional y gratis pero puede romperse o bloquearse sin aviso porque no es una API
-soportada. Fallback local obligatorio: SAPI vía `pyttsx3`, siempre disponible en Windows, sin
-red — JARVIS nunca queda mudo por depender de algo externo.
+Primario: `edge-tts` (calidad neural, voz "es-CO-SalomeNeural" — femenina, español colombiano,
+pedido explícito del usuario al renombrar la identidad hablada a "Alexa") — usa un endpoint no
+oficial de Microsoft, funcional y gratis pero puede romperse o bloquearse sin aviso porque no es
+una API soportada. Fallback local obligatorio: SAPI vía `pyttsx3`, siempre disponible en Windows,
+sin red — JARVIS nunca queda mudo por depender de algo externo.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import edge_tts
 import pyttsx3
 from playsound3 import playsound
 
-DEFAULT_EDGE_VOICE = "es-AR-TomasNeural"
+DEFAULT_EDGE_VOICE = "es-CO-SalomeNeural"
 
 
 class TTSClient(Protocol):
