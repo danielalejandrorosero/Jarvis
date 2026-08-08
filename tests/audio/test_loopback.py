@@ -105,7 +105,15 @@ class _FakeLoopbackMic:
 def _patch_device_resolution(
     monkeypatch: pytest.MonkeyPatch, *, device_sr: int = 48_000
 ) -> None:
+    """Stub de resolución de devices (salida Y entrada, para `is_combined_headset` — ver
+    `SystemAudioMonitor._run_with_com_initialized`) que evita cualquier llamada real a
+    `sounddevice` (nada de hardware real en tests, ver docstring del módulo). Los nombres
+    devueltos por `query_devices` no contienen ninguna palabra clave de headset (ver
+    `device._HEADSET_NAME_KEYWORDS`), así que `is_combined_headset` da `False` por default en
+    estos tests — el gate queda activo, el mismo comportamiento de siempre para quien no está
+    probando específicamente la detección de headset."""
     monkeypatch.setattr(loopback, "resolve_output_device", lambda device: 3)
+    monkeypatch.setattr(loopback, "resolve_input_device", lambda device: 7)
     monkeypatch.setattr(loopback, "output_sample_rate", lambda device: device_sr)
     monkeypatch.setattr(
         loopback.sd, "query_devices", lambda device: {"name": "Fake Output Device"}
@@ -297,6 +305,138 @@ def test_disables_gracefully_when_no_matching_loopback_device_found(
     monitor.stop()
 
     assert monitor.is_loud() is False
+
+
+# --- self-healing: reintento tras fallo y re-evaluación dinámica de headset -------------------
+
+
+def test_recovers_after_transient_loopback_failure_instead_of_disabling_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A diferencia del comportamiento anterior (un solo fallo apagaba el monitor para el resto
+    del proceso), un fallo transitorio de apertura del stream de loopback (p.ej. el headset se
+    desconectó y reconectó) se recupera solo en el siguiente reintento (`RETRY_SECONDS`), sin
+    reiniciar el proceso — mismo principio que el retry del mic en `pipeline.py` (commit 1a03ce0).
+
+    `RETRY_SECONDS` se deja en 0.1 (no 0.01, como el resto de los tests de esta sección) a
+    propósito: necesita ser sensiblemente más grande que `POLL_INTERVAL_SECONDS` (0.01) para que
+    la ventana en la que `_disabled` está en `True` (entre el fallo y el reintento exitoso) sea
+    lo bastante ancha como para que `_poll_until` la alcance a observar de forma confiable —
+    con valores del mismo orden de magnitud, el poll puede "saltarse" la ventana entera y ver
+    directamente el estado ya recuperado, dando un falso negativo intermitente."""
+    monkeypatch.setattr(loopback, "RETRY_SECONDS", 0.1)
+    _patch_device_resolution(monkeypatch)
+    loud = _float32_chunk_for_int16_level(5000.0)
+
+    class _FailingOnceRecorder:
+        def __enter__(self) -> Self:
+            raise RuntimeError(
+                "Error 0x88890008"
+            )  # AUDCLNT_E_DEVICE_IN_USE, transitorio
+
+        def __exit__(self, *_exc: object) -> bool:
+            return False
+
+    class _FlakyMic:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def recorder(self, **_kwargs: object) -> object:
+            self.attempts += 1
+            if self.attempts == 1:
+                return _FailingOnceRecorder()
+            return _FakeRecorder([loud])
+
+    # Una sola instancia reusada entre reintentos (a diferencia de un `lambda` que fabricara una
+    # nueva en cada llamada a `sc.get_microphone`) -- necesario para que `attempts` persista entre
+    # la vuelta que falla y la que se recupera; en producción esto lo modela `soundcard` mismo
+    # (el segundo intento de `get_microphone` es una llamada real nueva, no reusa el objeto roto,
+    # pero acá lo que importa simular es "el próximo intento sí abre bien", no la identidad del
+    # objeto mic en sí).
+    flaky_mic = _FlakyMic()
+    monkeypatch.setattr(
+        loopback.sc, "get_microphone", lambda *, id, include_loopback: flaky_mic
+    )
+    monitor = SystemAudioMonitor(chunk_seconds=0.01)
+
+    monitor.start()
+    try:
+        assert _poll_until(lambda: monitor._disabled)  # primer intento falla, degrada
+        assert _poll_until(
+            monitor.is_loud
+        )  # el reintento reabre el stream y se recupera
+    finally:
+        monitor.stop()
+
+
+def test_headset_detection_is_reevaluated_on_each_retry_and_toggles_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """El gate no queda atado a la decisión de `is_combined_headset` tomada en el primer arranque
+    del thread de fondo: si el usuario cambia de auriculares combinados a parlantes (o al revés)
+    a mitad de sesión, el siguiente reintento (`RETRY_SECONDS`) la recalcula y ajusta `_disabled`
+    en consecuencia, sin reiniciar el proceso — el crux del pedido de esta noche."""
+    monkeypatch.setattr(loopback, "RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(loopback, "resolve_output_device", lambda device: 3)
+    monkeypatch.setattr(loopback, "resolve_input_device", lambda device: 7)
+    monkeypatch.setattr(loopback, "output_sample_rate", lambda device: 48_000)
+    state = {"is_headset": True}
+
+    def _query_devices(device: int) -> dict[str, str]:
+        if state["is_headset"]:
+            return {"name": "Auriculares (Fake Headset)"}
+        return {"name": "Fake Output Device"}
+
+    monkeypatch.setattr(loopback.sd, "query_devices", _query_devices)
+    loud = _float32_chunk_for_int16_level(5000.0)
+    _patch_recorder(monkeypatch, [loud])
+    monitor = SystemAudioMonitor(chunk_seconds=0.01)
+
+    monitor.start()
+    try:
+        assert _poll_until(lambda: monitor._last_headset_decision is True)
+        assert monitor.is_loud() is False  # headset combinado -> gate nunca abre stream
+
+        state["is_headset"] = False
+        assert _poll_until(lambda: monitor._last_headset_decision is False)
+        assert _poll_until(
+            monitor.is_loud
+        )  # ya no es headset -> reabre el stream, gate activo
+    finally:
+        monitor.stop()
+
+
+def test_mic_device_is_forwarded_to_is_combined_headset_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`mic_device` (constructor) es lo único que `pipeline.run()` necesita pasarle a
+    `SystemAudioMonitor` para que pueda recalcular `is_combined_headset` por su cuenta (ver
+    docstring de la clase) — acá se confirma que efectivamente llega hasta
+    `resolve_input_device`/`sd.query_devices`, no solo que el parámetro existe."""
+    monkeypatch.setattr(loopback, "resolve_output_device", lambda device: 3)
+    monkeypatch.setattr(loopback, "output_sample_rate", lambda device: 48_000)
+    seen_devices: list[int] = []
+
+    def _query_devices(device: int) -> dict[str, str]:
+        seen_devices.append(device)
+        return {"name": "Fake Device"}
+
+    monkeypatch.setattr(loopback.sd, "query_devices", _query_devices)
+    monkeypatch.setattr(
+        loopback.sc,
+        "get_microphone",
+        lambda *, id, include_loopback: _FakeLoopbackMic([]),
+    )
+    # `mic_device=42` explícito: `resolve_input_device(42)` lo devuelve tal cual sin tocar
+    # `sd.query_devices()` (ver `device.resolve_input_device`) -- el único llamado a
+    # `sd.query_devices(42)` que puede aparecer viene de `is_combined_headset` usándolo.
+    monitor = SystemAudioMonitor(mic_device=42, chunk_seconds=0.01)
+
+    monitor.start()
+    try:
+        assert _poll_until(lambda: 42 in seen_devices)
+    finally:
+        monitor.stop()
 
 
 def test_disables_gracefully_when_com_initialization_fails(

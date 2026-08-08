@@ -36,12 +36,30 @@ import numpy as np
 import soundcard as sc
 import sounddevice as sd
 
-from jarvis.audio.device import output_sample_rate, resolve_output_device
+from jarvis.audio.device import (
+    is_combined_headset,
+    output_sample_rate,
+    resolve_input_device,
+    resolve_output_device,
+)
 
 CHUNK_SECONDS = (
     0.15  # ventana de medición: corta para reaccionar rápido sin sobrecargar el
 )
 # thread de fondo con lecturas constantes.
+
+RETRY_SECONDS = 2.0  # espera fija entre reintentos del thread de fondo tras un fallo de
+# device/stream/COM, antes de re-resolver todo desde cero -- mismo espíritu/estilo que
+# `COOLDOWN_SECONDS` del loop exterior de wake word en `pipeline.py` (backoff fijo, sin
+# exponencial ni jitter: sobre-ingeniería para este caso, ver commit 1a03ce0). Constante propia de
+# este módulo, no importada de `pipeline.py` -- `loopback.py` es standalone a propósito (ver
+# docstring del módulo). Reproducido en vivo esta noche (headset desconectado a mitad de sesión):
+# antes de este fix, cualquier fallo de loopback WASAPI (device invalidado, conflicto de modo
+# exclusivo) apagaba `SystemAudioMonitor` para el resto del proceso -- a diferencia del mic de
+# entrada, que ya reintenta indefinidamente desde 1a03ce0. Sin distinguir "device transitoriamente
+# invalidado" de "no hay ningún device de salida en todo el sistema": mismo trade-off ya aceptado
+# para el mic -- reintentar indefinido con backoff cubre ambos casos igual de bien, y evitar esa
+# distinción es más simple que intentar adivinarla.
 
 # Umbral de RMS (escala int16) por encima del cual se considera "el sistema está sonando fuerte".
 #
@@ -157,17 +175,34 @@ class SystemAudioMonitor:
 
     `is_loud()` es una lectura barata (un lock corto, sin I/O) pensada para llamarse desde los
     hot paths de `detect()`/`record_command()` sin bloquearlos.
+
+    Self-contenido a propósito respecto de si el gate debe aplicar o no: en cada intento de
+    (re)arranque del stream, el propio thread de fondo re-resuelve el mic y la salida actuales y
+    recalcula `device.is_combined_headset(mic, salida)` (ver `_run_with_com_initialized`) — no
+    depende de que `pipeline.run()` le comunique ese estado una sola vez al construirlo. Eso es lo
+    que permite que la decisión "¿aplica el gate?" siga vigente si el usuario cambia de auriculares
+    a parlantes (o al revés) a mitad de sesión, sin reiniciar el proceso: cada reintento (ver
+    `RETRY_SECONDS`) es también una oportunidad de reconsiderarla, no solo de reabrir un stream
+    roto. `mic_device` (ver `__init__`) es lo único que este módulo necesita que le pasen desde
+    afuera para poder hacer esa cuenta — `pipeline.run()` ya lo calcula (es su propio parámetro
+    `device`, el mic a usar) y no tiene ningún motivo para calcular `is_combined_headset` por su
+    cuenta además.
     """
 
     def __init__(
         self,
         *,
         device: int | None = None,
+        mic_device: int | None = None,
         threshold: float = DEFAULT_LOUDNESS_THRESHOLD,
         chunk_seconds: float = CHUNK_SECONDS,
         enabled: bool = True,
     ) -> None:
-        self._device = device
+        self._device = device  # device de SALIDA a monitorear por loopback (ver resolve_output_device)
+        self._mic_device = (
+            mic_device  # device de ENTRADA actual — solo para is_combined_headset,
+        )
+        # nunca se abre un stream de entrada acá (eso lo hace `pipeline.py`/`wake_word.py`).
         self._threshold = threshold
         self._chunk_seconds = chunk_seconds
         self._enabled = enabled
@@ -176,16 +211,26 @@ class SystemAudioMonitor:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         # Se pone en True si no hay device de salida, el stream de loopback no pudo abrirse
-        # (p.ej. conflicto de modo exclusivo), o si `enabled=False` (ver `device.is_combined_headset`
-        # — el gate no tiene sentido con un headset, donde no hay filtración acústica real del
-        # audio de salida hacia el mic) — desde ahí `is_loud()` siempre devuelve False en vez de
-        # tumbar JARVIS por una feature de robustez nice-to-have (ver docstring del módulo).
+        # (p.ej. conflicto de modo exclusivo), si el mic y la salida resultan ser el mismo headset
+        # combinado (`device.is_combined_headset` — el gate no tiene sentido ahí, no hay
+        # filtración acústica real del audio de salida hacia el mic del mismo headset), o si
+        # `enabled=False` (apagado explícito, ver `start()`) — desde ahí `is_loud()` siempre
+        # devuelve False en vez de tumbar JARVIS por una feature de robustez nice-to-have (ver
+        # docstring del módulo). A diferencia de antes, este flag ya NO es terminal salvo por
+        # `enabled=False`: el thread de fondo (`_run_with_com_initialized`) lo vuelve a poner en
+        # `False` en cuanto un reintento consigue reabrir el stream y deja de detectar headset —
+        # se degrada temporalmente, no para siempre (ver `RETRY_SECONDS`).
         self._disabled = not enabled
+        # Última decisión de `is_combined_headset` ya logueada, para no repetir el mismo mensaje
+        # en stderr en cada ciclo de reintento mientras la situación no cambió (ver
+        # `_apply_headset_decision`) — `None` significa "todavía no se evaluó ninguna vez".
+        self._last_headset_decision: bool | None = None
 
     def start(self) -> None:
         """Arrancar el thread de fondo. Idempotente: no hace nada si ya está corriendo. No-op
-        si `enabled=False` (ver `__init__`) — no tiene sentido abrir un stream de loopback que
-        `is_loud()` va a ignorar de todos modos."""
+        si `enabled=False` (ver `__init__`) — apagado explícito y permanente para esta instancia,
+        distinto del apagado dinámico por headset (`_disabled`), que si necesita el thread
+        corriendo para poder reconsiderarse (ver docstring de la clase)."""
         if not self._enabled:
             return
         if self._thread is not None:
@@ -227,60 +272,133 @@ class SystemAudioMonitor:
                 ctypes.windll.ole32.CoUninitialize()
 
     def _run_with_com_initialized(self) -> None:
-        try:
-            resolved_device = resolve_output_device(self._device)
-            device_sr = output_sample_rate(resolved_device)
-            device_name = str(sd.query_devices(resolved_device)["name"])
-            # `sounddevice`/`resolve_output_device` solo se usan para resolver *qué* device de
-            # salida y su sample rate nativo (eso funciona bien — ver `device.py`); el device
-            # loopback en sí lo resuelve `soundcard` por nombre, matcheando contra el mismo
-            # endpoint WASAPI (ver docstring del módulo sobre por qué `sounddevice` no puede
-            # abrir el loopback él mismo).
-            loopback_mic = sc.get_microphone(id=device_name, include_loopback=True)
-        except (RuntimeError, sd.PortAudioError, IndexError) as exc:
-            self._disable(exc)
-            return
-        chunk_samples = max(1, int(self._chunk_seconds * device_sr))
-        try:
-            # `soundcard` emite `SoundcardRuntimeWarning` cuando WASAPI reporta un frame de audio
-            # perdido en el buffer interno (visto en vivo: "data discontinuity in recording",
-            # confirmado como comportamiento esperado/no-fatal de la librería bajo carga, no un
-            # bug de este código — ver issues de `bastibe/SoundCard` sobre buffer underruns).
-            # `warnings.filterwarnings` muta el filtro global de `warnings` del proceso entero
-            # (no hay forma de scoparlo solo a este thread/loop sin `catch_warnings()`, que la
-            # propia documentación de `warnings` marca como no thread-safe si se mantiene abierto
-            # mientras corren otros threads — este monitor vive mientras JARVIS corre, así que
-            # mantenerlo abierto todo ese tiempo sería igual de global en la práctica). Se acepta
-            # el filtro global acá porque `SoundcardRuntimeWarning` es una clase específica de
-            # una sola librería para un solo escenario (frame perdido en loopback) — no hay
-            # ningún otro código en este proceso al que le importe verla, y `is_loud()` es un
-            # gate de nivel aproximado (no captura de alta fidelidad), así que perder un frame
-            # ocasional no afecta su corrección. Sin silenciar, el warning spamea
-            # `jarvis-error.log` en cada ocurrencia, degradando la señal real de ese log.
-            warnings.filterwarnings(
-                "ignore", category=sc.mediafoundation.SoundcardRuntimeWarning
-            )
-            with loopback_mic.recorder(
-                samplerate=device_sr, blocksize=chunk_samples
-            ) as recorder:
-                while not self._stop_event.is_set():
-                    chunk = recorder.record(numframes=chunk_samples)
-                    level = _chunk_rms(_to_int16_scale(chunk.reshape(-1)))
-                    with self._lock:
-                        self._level = level
-        except (RuntimeError, OSError) as exc:
-            # `soundcard` reporta fallos de COM/WASAPI (device desconectado, conflicto de modo
-            # exclusivo, endpoint que dejó de existir) como `RuntimeError` de forma uniforme (ver
-            # `soundcard.mediafoundation._handle_error`) — no hay un tipo de excepción propio
-            # como `sd.PortAudioError` acá. Mismo contrato que antes: degradar en silencio
-            # (`_disabled=True`, `is_loud()` siempre `False`) en vez de tumbar este thread de
-            # fondo con un traceback crudo — ver docstring de la clase.
-            self._disable(exc)
+        """Bucle de reintento indefinido (hasta `stop()`): en cada vuelta, re-resuelve el device
+        de salida Y el de entrada actuales desde cero (sin cachear nada de una vuelta anterior —
+        mismo principio que el retry del mic en `pipeline.py`, commit 1a03ce0, aplicado acá al
+        lado de loopback), recalcula si aplica el gate (`is_combined_headset`), y si aplica abre
+        un stream de loopback nuevo. Un fallo en cualquier paso (resolución de device, apertura
+        del stream, o el propio stream durante la lectura) degrada a `_disabled=True` de forma
+        TEMPORAL: se loguea, se espera `RETRY_SECONDS` (interrumpible por `stop()`, no bloquea el
+        shutdown) y se reintenta desde el principio — nunca propaga la excepción hacia `_run()`."""
+        while not self._stop_event.is_set():
+            try:
+                resolved_output = resolve_output_device(self._device)
+                device_sr = output_sample_rate(resolved_output)
+                device_name = str(sd.query_devices(resolved_output)["name"])
+                # `sounddevice`/`resolve_output_device` solo se usan para resolver *qué* device de
+                # salida y su sample rate nativo (eso funciona bien — ver `device.py`); el device
+                # loopback en sí lo resuelve `soundcard` por nombre, matcheando contra el mismo
+                # endpoint WASAPI (ver docstring del módulo sobre por qué `sounddevice` no puede
+                # abrir el loopback él mismo).
+                resolved_mic = resolve_input_device(self._mic_device)
+                is_headset = is_combined_headset(resolved_mic, resolved_output)
+            except (RuntimeError, sd.PortAudioError, IndexError) as exc:
+                self._disable(exc)
+                if self._stop_event.wait(RETRY_SECONDS):
+                    return
+                continue
+
+            self._apply_headset_decision(is_headset)
+            if is_headset:
+                # No tiene sentido abrir un stream de loopback que `is_loud()` va a ignorar de
+                # todos modos (ver `device.is_combined_headset`) — pero el thread SIGUE corriendo
+                # y reintentando, así que si el usuario cambia a parlantes a mitad de sesión, la
+                # próxima vuelta lo detecta y reabre el gate sin reiniciar el proceso.
+                if self._stop_event.wait(RETRY_SECONDS):
+                    return
+                continue
+
+            try:
+                loopback_mic = sc.get_microphone(id=device_name, include_loopback=True)
+            except (RuntimeError, IndexError) as exc:
+                self._disable(exc)
+                if self._stop_event.wait(RETRY_SECONDS):
+                    return
+                continue
+
+            chunk_samples = max(1, int(self._chunk_seconds * device_sr))
+            try:
+                # `soundcard` emite `SoundcardRuntimeWarning` cuando WASAPI reporta un frame de
+                # audio perdido en el buffer interno (visto en vivo: "data discontinuity in
+                # recording", confirmado como comportamiento esperado/no-fatal de la librería bajo
+                # carga, no un bug de este código — ver issues de `bastibe/SoundCard` sobre buffer
+                # underruns). `warnings.filterwarnings` muta el filtro global de `warnings` del
+                # proceso entero (no hay forma de scoparlo solo a este thread/loop sin
+                # `catch_warnings()`, que la propia documentación de `warnings` marca como no
+                # thread-safe si se mantiene abierto mientras corren otros threads — este monitor
+                # vive mientras JARVIS corre, así que mantenerlo abierto todo ese tiempo sería
+                # igual de global en la práctica). Se acepta el filtro global acá porque
+                # `SoundcardRuntimeWarning` es una clase específica de una sola librería para un
+                # solo escenario (frame perdido en loopback) — no hay ningún otro código en este
+                # proceso al que le importe verla, y `is_loud()` es un gate de nivel aproximado
+                # (no captura de alta fidelidad), así que perder un frame ocasional no afecta su
+                # corrección. Sin silenciar, el warning spamea `jarvis-error.log` en cada
+                # ocurrencia, degradando la señal real de ese log.
+                warnings.filterwarnings(
+                    "ignore", category=sc.mediafoundation.SoundcardRuntimeWarning
+                )
+                with loopback_mic.recorder(
+                    samplerate=device_sr, blocksize=chunk_samples
+                ) as recorder:
+                    # El stream abrió bien y no es un headset combinado -- el gate vuelve a estar
+                    # activo de verdad a partir de acá (recién ahora, no antes: mientras no haya
+                    # un stream real produciendo niveles, `is_loud()` debe seguir devolviendo
+                    # `False`, nunca un valor obsoleto de una corrida anterior).
+                    self._disabled = False
+                    while not self._stop_event.is_set():
+                        chunk = recorder.record(numframes=chunk_samples)
+                        level = _chunk_rms(_to_int16_scale(chunk.reshape(-1)))
+                        with self._lock:
+                            self._level = level
+            except (RuntimeError, OSError) as exc:
+                # `soundcard` reporta fallos de COM/WASAPI (device desconectado, conflicto de modo
+                # exclusivo, endpoint que dejó de existir) como `RuntimeError` de forma uniforme
+                # (ver `soundcard.mediafoundation._handle_error`) — no hay un tipo de excepción
+                # propio como `sd.PortAudioError` acá.
+                self._disable(exc)
+                if self._stop_event.wait(RETRY_SECONDS):
+                    return
+                continue
+            # Si se llega acá, el `while not self._stop_event.is_set()` interior terminó porque
+            # `stop()` lo pidió (no por una excepción, ya manejada arriba) — la condición del
+            # `while` exterior también da `False` en la próxima vuelta, así que el bucle termina
+            # solo, sin necesitar un `return` explícito acá.
 
     def _disable(self, exc: Exception) -> None:
+        """Degradar `is_loud()` a `False` tras un fallo de device/stream/COM — TEMPORAL: quien
+        llama sigue reintentando (ver `_run_with_com_initialized`), esto solo loguea y marca el
+        estado actual como no confiable mientras tanto."""
         self._disabled = True
         print(
-            f"Monitor de audio del sistema deshabilitado (loopback WASAPI falló: {exc!r}). "
-            "El gate de audio fuerte no va a activarse — JARVIS sigue funcionando sin él.",
+            f"Monitor de audio del sistema: fallo de loopback WASAPI ({exc!r}). Gate de audio "
+            f"fuerte desactivado temporalmente, reintentando en {RETRY_SECONDS}s (re-resolviendo "
+            "el device desde cero, no reutiliza el stream roto) — JARVIS sigue funcionando sin "
+            "el gate mientras tanto.",
             file=sys.stderr,
         )
+
+    def _apply_headset_decision(self, is_headset: bool) -> None:
+        """Actualizar `_disabled` según si el mic/salida actuales son el mismo headset combinado,
+        logueando solo en la transición (no en cada vuelta del retry mientras la situación no
+        cambió — evitaría spamear stderr cada `RETRY_SECONDS` durante toda una sesión larga con
+        auriculares puestos)."""
+        if is_headset == self._last_headset_decision:
+            return
+        previous = self._last_headset_decision
+        self._last_headset_decision = is_headset
+        if is_headset:
+            self._disabled = True
+            print(
+                "Monitor de audio del sistema: mic y salida son el mismo headset combinado "
+                "(sin filtración acústica real que gatear, ver device.is_combined_headset) — "
+                "gate de audio fuerte desactivado mientras siga así.",
+                file=sys.stderr,
+            )
+        elif previous is not None:
+            # `previous is None` es la primera vuelta del thread — si ya arranca sin headset (el
+            # caso más común) no es una "vuelta" de nada, no hay nada que anunciar.
+            print(
+                "Monitor de audio del sistema: ya no se detecta headset combinado — "
+                "reanudando el gate de audio fuerte.",
+                file=sys.stderr,
+            )

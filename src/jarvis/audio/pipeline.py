@@ -103,12 +103,7 @@ import numpy as np
 import sounddevice as sd
 from openai import OpenAI
 
-from jarvis.audio.device import (
-    input_sample_rate,
-    is_combined_headset,
-    resolve_input_device,
-    resolve_output_device,
-)
+from jarvis.audio.device import input_sample_rate, resolve_input_device
 from jarvis.audio.loopback import SystemAudioGate, SystemAudioMonitor
 from jarvis.audio.resample import resample
 from jarvis.audio.stt import load_stt_client, transcribe
@@ -1016,21 +1011,18 @@ def run(
     # ver `loopback.py`: mide RMS de lo que reproduce el sistema para gatear falsos triggers de
     # wake word y contaminación del audio del comando por sonido del propio PC.
     #
-    # Desactivado si el mic y la salida de audio son el mismo headset combinado
-    # (`is_combined_headset`) — confirmado en vivo esta noche: con auriculares puestos, el gate
-    # bloqueaba CUALQUIER detección de wake word mientras sonaba audio de juego, porque no hay
-    # filtración acústica real del audio de salida hacia el mic del mismo headset (a diferencia
-    # de un parlante + mic abierto, el caso que el gate sí necesita cubrir). Resolución best-effort:
-    # si algo falla acá (dispositivo no disponible en este instante), se asume que NO es un
-    # headset combinado y el gate queda activo — degradar hacia el comportamiento ya probado esta
-    # noche, no hacia uno nuevo sin verificar.
-    try:
-        headset_in_use = is_combined_headset(
-            resolve_input_device(device), resolve_output_device(None)
-        )
-    except (RuntimeError, sd.PortAudioError):
-        headset_in_use = False
-    system_audio = SystemAudioMonitor(enabled=not headset_in_use)
+    # `mic_device=device` es lo único que `SystemAudioMonitor` necesita de acá para decidir por su
+    # cuenta, y de forma dinámica, si el gate debe aplicar (`device.is_combined_headset` — no
+    # tiene sentido con un headset combinado, donde no hay filtración acústica real del audio de
+    # salida hacia el mic del mismo headset). Antes esa decisión se calculaba UNA sola vez acá, al
+    # arrancar (`is_combined_headset(...)` + `enabled=not headset_in_use`), y quedaba fija para
+    # toda la corrida — si el usuario cambiaba de auriculares a parlantes (o al revés) a mitad de
+    # sesión, o si el headset se desconectaba, el gate no se reajustaba hasta un reinicio manual
+    # del proceso. Ahora `SystemAudioMonitor` re-resuelve el mic y la salida y recalcula
+    # `is_combined_headset` en cada intento de (re)arranque de su thread de fondo (ver
+    # `RETRY_SECONDS` en `loopback.py`), así que sigue vigente sin que `pipeline.py` tenga que
+    # comunicarle nada más allá de qué mic está usando.
+    system_audio = SystemAudioMonitor(mic_device=device)
     system_audio.start()
     # Servicio de fondo independiente, sin relación con audio: acepta automáticamente las colas
     # de matchmaking de League of Legends vía la LCU API mientras JARVIS está corriendo, sin
