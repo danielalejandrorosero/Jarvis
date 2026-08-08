@@ -416,6 +416,28 @@ def _is_affirmative(text: str) -> bool:
     return all(word in _AFFIRMATIVE_WORDS for word in words)
 
 
+# Pedido explícito del usuario: poder decirle a JARVIS que "se vaya"/"descanse" y que dejе de
+# responder hasta que le digas que "vuelva". JARVIS nunca deja de escuchar el micrófono de
+# verdad (si lo hiciera, no habría forma de que "Jarvis, volvé" lo reactive) — mientras está
+# "dormido" simplemente ignora cualquier comando que no sea la frase para despertarlo, ver `run()`.
+_SLEEP_WORDS = frozenset(
+    {"andate", "vete", "descansa", "descansá", "dormite", "dormi", "dormí", "silencio"}
+)
+_WAKE_WORDS = frozenset(
+    {"volve", "volvé", "vuelve", "desperta", "despertá", "despierta"}
+)
+
+
+def _contains_any_word(text: str, trigger_words: frozenset[str]) -> bool:
+    """`True` si alguna palabra de `text` (normalizada: minúsculas, sin puntuación) está en
+    `trigger_words` — a diferencia de `_is_affirmative`, acá alcanza con que aparezca en
+    cualquier parte de la frase (ej. "Jarvis, andate a descansar"), no que sea la frase entera:
+    esto no es un gate de seguridad tipo CONFIRM, es solo un modo de "no me molestes"."""
+    normalized = text.strip().lower()
+    words = [word.strip(".,!¡¿?;:") for word in normalized.split()]
+    return any(word in trigger_words for word in words if word)
+
+
 class VoiceConfirmationChannel:
     """Implementa `ConfirmationChannel` (`jarvis.security.policy`, ADR-0005) reusando el TTS/STT
     que ya vive en este módulo: pregunta por voz con `tts.speak`, graba la respuesta con el
@@ -643,6 +665,7 @@ def run(
     policy = PolicyEngine(confirmation)
 
     deadline = time.monotonic() + duration if duration is not None else None
+    sleeping = False
     print(
         f"Escuchando... decí 'Hey Jarvis' (Ctrl+C para salir, umbral={threshold})",
         file=sys.stderr,
@@ -683,6 +706,21 @@ def run(
                 # El modelo de transcripción puede devolver vacío sobre silencio puro; no tiene
                 # sentido gastar una llamada al LLM sobre texto vacío.
                 print("(nada que responder, no se detectó habla real)", file=sys.stderr)
+            elif sleeping:
+                if _contains_any_word(text, _WAKE_WORDS):
+                    sleeping = False
+                    wake_reply = "Volví. ¿En qué te ayudo?"
+                    print(f"JARVIS: {wake_reply}")
+                    tts.speak(wake_reply)
+                else:
+                    print("(dormido, ignorando)", file=sys.stderr)
+            elif _contains_any_word(text, _SLEEP_WORDS):
+                sleeping = True
+                sleep_reply = (
+                    'Listo, descanso. Decime "Jarvis, volvé" cuando me necesites.'
+                )
+                print(f"JARVIS: {sleep_reply}")
+                tts.speak(sleep_reply)
             else:
                 reply = dispatch_turn(
                     text,

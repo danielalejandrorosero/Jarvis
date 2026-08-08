@@ -366,6 +366,42 @@ def test_is_affirmative(text: str, expected: bool) -> None:
     assert pipeline._is_affirmative(text) is expected
 
 
+# --- _contains_any_word (modo dormir/despertar) -----------------------------------------------
+# Pedido explícito del usuario: "Jarvis, andate/descansá" lo pone a dormir (ignora todo menos la
+# frase para despertarlo); "Jarvis, volvé" lo despierta. A diferencia de `_is_affirmative`, acá
+# alcanza con que la palabra aparezca en cualquier parte de la frase, no que sea toda la frase.
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("andate", True),
+        ("Jarvis, andate a descansar", True),
+        ("descansá un rato", True),
+        ("vete de acá", True),
+        ("", False),
+        ("quiero un café", False),
+        ("qué hora es", False),
+    ],
+)
+def test_contains_any_word_detects_sleep_phrases(text: str, expected: bool) -> None:
+    assert pipeline._contains_any_word(text, pipeline._SLEEP_WORDS) is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("volvé", True),
+        ("Jarvis, vuelve ya", True),
+        ("despertá", True),
+        ("", False),
+        ("quiero un café", False),
+    ],
+)
+def test_contains_any_word_detects_wake_phrases(text: str, expected: bool) -> None:
+    assert pipeline._contains_any_word(text, pipeline._WAKE_WORDS) is expected
+
+
 # --- dispatch_turn ---------------------------------------------------------------------------
 
 
