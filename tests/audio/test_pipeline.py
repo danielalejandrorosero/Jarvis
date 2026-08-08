@@ -42,7 +42,7 @@ from jarvis.audio.pipeline import (
 )
 from jarvis.audio.tts import TTSClient
 from jarvis.llm.client import LLMResult, ToolCall
-from jarvis.memory.store import save_fact
+from jarvis.memory.store import save_fact, save_speech_sample
 from jarvis.security.policy import PolicyEngine
 from jarvis.tools.base import RiskLevel, Tool
 from jarvis.tools.weather import WeatherTool
@@ -744,3 +744,98 @@ def test_system_prompt_instructs_llm_not_to_remember_web_data_content() -> None:
     para `<web_data>` en sí."""
     assert "remember_fact" in pipeline.SYSTEM_PROMPT
     assert pipeline.WEB_DATA_OPEN_TAG in pipeline.SYSTEM_PROMPT
+
+
+# --- muestras de habla (estilo del usuario, distinto de `remembered_facts`) --------------------
+# `speech_samples` (`jarvis.memory.store`) se guarda automáticamente, sin curación del LLM — acá
+# solo se testea que `_build_system_prompt`/`dispatch_turn` las inyecte con su propio framing,
+# separado de `remembered_facts`, y que no aparezca una sección vacía sin muestras guardadas.
+
+
+def test_dispatch_turn_without_saved_speech_samples_has_no_style_section(
+    tmp_path: Path,
+) -> None:
+    """Sin muestras de habla guardadas, no se agrega la sección de estilo (ni un header vacío)
+    — mismo criterio que el caso de `facts` vacío."""
+    llm = _ScriptedLLMClient([LLMResult(text="ok", tool_call=None)])
+    policy = MagicMock(spec=PolicyEngine)
+
+    pipeline.dispatch_turn(
+        "hola",
+        llm=llm,
+        tools={},
+        tool_schemas=[],
+        policy=policy,
+        memory_db_path=tmp_path / "jarvis.db",
+    )
+
+    system_content = llm.calls[0][0]["content"]
+    # Igual a `SYSTEM_PROMPT` sin tocar — el tag en sí aparece ahí (instrucción de antemano sobre
+    # cómo tratarlo, igual que `MEMORY_DATA_OPEN_TAG`), pero no se agrega una sección de estilo
+    # real (con el framing header y el wrapper de datos) sin muestras guardadas.
+    assert system_content == pipeline.SYSTEM_PROMPT
+    assert pipeline._SPEECH_STYLE_FRAMING_HEADER not in system_content
+
+
+def test_dispatch_turn_injects_speech_style_examples_into_system_prompt(
+    tmp_path: Path,
+) -> None:
+    """Con muestras guardadas, se agregan como sección aparte, rotulada y envuelta en
+    `<speech_style_examples>`, distinta de `<remembered_facts>`, más reciente primero."""
+    db_path = tmp_path / "jarvis.db"
+    save_speech_sample("ey parce, hágale con eso", db_path=db_path)
+    save_speech_sample("dale pues, de una", db_path=db_path)
+    llm = _ScriptedLLMClient([LLMResult(text="ok", tool_call=None)])
+    policy = MagicMock(spec=PolicyEngine)
+
+    pipeline.dispatch_turn(
+        "hola",
+        llm=llm,
+        tools={},
+        tool_schemas=[],
+        policy=policy,
+        memory_db_path=db_path,
+    )
+
+    system_content = llm.calls[0][0]["content"]
+    assert system_content.startswith(pipeline.SYSTEM_PROMPT)
+    assert pipeline._SPEECH_STYLE_FRAMING_HEADER in system_content
+    assert pipeline.SPEECH_STYLE_OPEN_TAG in system_content
+    assert pipeline.SPEECH_STYLE_CLOSE_TAG in system_content
+    assert "- dale pues, de una" in system_content
+    assert "- ey parce, hágale con eso" in system_content
+    # Más reciente primero, como devuelve `list_speech_samples`.
+    assert system_content.index("dale pues, de una") < system_content.index(
+        "ey parce, hágale con eso"
+    )
+    # Sección de estilo separada de la de hechos (framing distinto, no se pisan).
+    assert pipeline._MEMORY_FRAMING_HEADER not in system_content
+
+
+def test_dispatch_turn_injects_both_facts_and_speech_style_sections_when_present(
+    tmp_path: Path,
+) -> None:
+    """Ambas secciones (hechos y estilo) pueden convivir en el mismo prompt, cada una con su
+    propio wrapper — no se mezclan ni se pisan entre sí."""
+    db_path = tmp_path / "jarvis.db"
+    save_fact("el usuario prefiere respuestas cortas", db_path=db_path)
+    save_speech_sample("ey parce, hágale con eso", db_path=db_path)
+    llm = _ScriptedLLMClient([LLMResult(text="ok", tool_call=None)])
+    policy = MagicMock(spec=PolicyEngine)
+
+    pipeline.dispatch_turn(
+        "hola",
+        llm=llm,
+        tools={},
+        tool_schemas=[],
+        policy=policy,
+        memory_db_path=db_path,
+    )
+
+    system_content = llm.calls[0][0]["content"]
+    assert pipeline.MEMORY_DATA_OPEN_TAG in system_content
+    assert pipeline.SPEECH_STYLE_OPEN_TAG in system_content
+    # El bloque de hechos aparece antes que el de estilo (orden fijo de `_build_system_prompt`).
+    assert system_content.index(pipeline.MEMORY_DATA_OPEN_TAG) < system_content.index(
+        pipeline.SPEECH_STYLE_OPEN_TAG
+    )
