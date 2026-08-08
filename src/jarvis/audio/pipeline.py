@@ -671,6 +671,10 @@ def run(
         f"(Ctrl+C para salir, umbral={threshold})",
         file=sys.stderr,
     )
+    # Corre sin ventana visible (arranque automático, ver scripts/start_jarvis.ps1) — este es el
+    # único aviso de que arrancó bien y quedó escuchando (pedido explícito del usuario: "al
+    # iniciar quiero que se presente para saber si está en buen estado").
+    tts.speak("JARVIS activo y funcionando correctamente.")
     try:
         while deadline is None or time.monotonic() < deadline:
             remaining = (deadline - time.monotonic()) if deadline is not None else None
