@@ -68,7 +68,9 @@ class FallbackTTSClient:
         try:
             self._primary.speak(text)
         except Exception as exc:  # noqa: BLE001 — fallback documentado (ADR-0004), no descuido
-            print(f"TTS primario falló ({exc!r}), usando fallback local.", file=sys.stderr)
+            print(
+                f"TTS primario falló ({exc!r}), usando fallback local.", file=sys.stderr
+            )
             self._fallback.speak(text)
 
 

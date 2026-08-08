@@ -16,6 +16,9 @@ import numpy as np
 import sounddevice as sd
 from openwakeword.model import Model
 
+from jarvis.audio.device import input_sample_rate, resolve_input_device
+from jarvis.audio.resample import fit_frame, resample
+
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1280  # 80ms a 16kHz: tamaño de chunk recomendado por openWakeWord
 WAKEWORD_NAME = "hey_jarvis"
@@ -53,7 +56,13 @@ def iter_microphone_frames(
     device: int | None = None,
     duration: float | None = None,
 ) -> Generator[np.ndarray, None, None]:
-    """Generar frames mono int16 desde el dispositivo de entrada dado (o el default).
+    """Generar frames mono int16 a `sample_rate` desde el dispositivo de entrada dado (o el
+    default), resampleados desde la tasa nativa del dispositivo.
+
+    Grabamos a la tasa nativa del device (no `sample_rate` directo): confirmado en vivo que el
+    endpoint WASAPI del micrófono de esta máquina no acepta pedir 16kHz (falla con
+    "Invalid sample rate"; está fijado a 48000Hz en Windows), así que grabamos a 48000 y
+    resampleamos en software (`resample.py`) al `sample_rate` que espera el modelo.
 
     Si `duration` (segundos) está seteado, deja de generar frames pasado ese tiempo en vez de
     correr para siempre — necesario para probarlo sin depender de Ctrl+C manual.
@@ -62,17 +71,23 @@ def iter_microphone_frames(
     explícitamente con `.close()` antes de que termine solo (ver `pipeline.py`, que corta la
     escucha para abrir un stream de grabación separado sin dejar dos streams abiertos a la vez).
     """
+    resolved_device = resolve_input_device(device)
+    device_sr = input_sample_rate(resolved_device)
+    native_frame_samples = round(frame_samples * device_sr / sample_rate)
     deadline = time.monotonic() + duration if duration is not None else None
     with sd.InputStream(
-        samplerate=sample_rate,
+        samplerate=device_sr,
         channels=1,
         dtype="int16",
-        blocksize=frame_samples,
-        device=device,
+        blocksize=native_frame_samples,
+        device=resolved_device,
     ) as stream:
         while deadline is None or time.monotonic() < deadline:
-            frame, _overflowed = stream.read(frame_samples)
-            yield frame.reshape(-1)
+            frame, _overflowed = stream.read(native_frame_samples)
+            resampled = resample(
+                frame.reshape(-1), orig_sr=device_sr, target_sr=sample_rate
+            )
+            yield fit_frame(resampled, frame_samples)
 
 
 def detect(
@@ -86,7 +101,11 @@ def detect(
         predictions = model.predict(frame)
         for wakeword, score in predictions.items():
             if score >= threshold:
-                yield Detection(wakeword=wakeword, score=float(score), timestamp=dt.datetime.now(dt.UTC))
+                yield Detection(
+                    wakeword=wakeword,
+                    score=float(score),
+                    timestamp=dt.datetime.now(dt.UTC),
+                )
 
 
 def run(
@@ -118,13 +137,21 @@ def run(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prototipo de detección de wake word para JARVIS")
+    parser = argparse.ArgumentParser(
+        description="Prototipo de detección de wake word para JARVIS"
+    )
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     parser.add_argument(
-        "--device", type=int, default=None, help="Índice del dispositivo de entrada (ver sounddevice.query_devices())"
+        "--device",
+        type=int,
+        default=None,
+        help="Índice del dispositivo de entrada (ver sounddevice.query_devices())",
     )
     parser.add_argument(
-        "--duration", type=float, default=None, help="Segundos a escuchar antes de cortar solo (default: infinito, Ctrl+C)"
+        "--duration",
+        type=float,
+        default=None,
+        help="Segundos a escuchar antes de cortar solo (default: infinito, Ctrl+C)",
     )
     args = parser.parse_args()
     run(threshold=args.threshold, device=args.device, duration=args.duration)

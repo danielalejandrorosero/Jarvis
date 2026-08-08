@@ -12,7 +12,7 @@ import os
 import numpy as np
 from faster_whisper import WhisperModel
 
-MODEL_SIZE = "small"
+MODEL_SIZE = "medium"
 LANGUAGE = "es"
 
 
@@ -45,7 +45,9 @@ def _register_cuda_dll_dirs() -> None:
         os.environ["PATH"] = os.pathsep.join([*dirs_to_add, os.environ.get("PATH", "")])
 
 
-def load_whisper_model(*, device: str = "cpu", compute_type: str | None = None) -> WhisperModel:
+def load_whisper_model(
+    *, device: str = "cpu", compute_type: str | None = None
+) -> WhisperModel:
     """Cargar el modelo Whisper.
 
     Default CPU porque siempre funciona sin dependencias extra. `device="cuda"` usa la GPU si
