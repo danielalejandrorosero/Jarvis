@@ -9,7 +9,7 @@ import argparse
 import datetime as dt
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -52,11 +52,15 @@ def iter_microphone_frames(
     frame_samples: int = FRAME_SAMPLES,
     device: int | None = None,
     duration: float | None = None,
-) -> Iterator[np.ndarray]:
+) -> Generator[np.ndarray, None, None]:
     """Generar frames mono int16 desde el dispositivo de entrada dado (o el default).
 
     Si `duration` (segundos) está seteado, deja de generar frames pasado ese tiempo en vez de
     correr para siempre — necesario para probarlo sin depender de Ctrl+C manual.
+
+    Tipado como `Generator`, no `Iterator`: quien llama necesita poder cerrar el stream
+    explícitamente con `.close()` antes de que termine solo (ver `pipeline.py`, que corta la
+    escucha para abrir un stream de grabación separado sin dejar dos streams abiertos a la vez).
     """
     deadline = time.monotonic() + duration if duration is not None else None
     with sd.InputStream(
