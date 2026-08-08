@@ -226,8 +226,13 @@ SYSTEM_PROMPT = (
     "en un tono parecido, nunca las repitas literalmente ni las trates como el comando actual."
 )
 MAX_TOOL_CALLS_PER_TURN = (
-    3  # tope duro: corta un turno si el LLM insiste en pedir tools
+    5  # tope duro: corta un turno si el LLM insiste en pedir tools
 )
+# Antes en 3 — confirmado en vivo que se quedaba corto: "reproducí tal canción" necesita
+# search_web (encontrar el video) + open_url (abrirlo) + una llamada más para la respuesta
+# final = 3 llamadas al LLM justo en el límite, así que cualquier mínima ineficiencia (el modelo
+# reintentando, pidiendo un tool de más) agotaba el tope y devolvía "No pude completar la
+# solicitud" en vez de terminar el flujo. 5 da margen real sin volverse un loop sin fin.
 _AFFIRMATIVE_WORDS = frozenset(
     {
         "si",
