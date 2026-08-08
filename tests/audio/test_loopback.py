@@ -1,13 +1,20 @@
 """Tests para `jarvis.audio.loopback.SystemAudioMonitor`.
 
-No abren un stream WASAPI real: `sd.InputStream` se reemplaza por un stub controlado por el
-test (mismo enfoque que `tests/audio/test_pipeline.py` usa para `sd.rec` en
-`measure_noise_floor`), así que corren rápido, sin hardware de audio, CI-safe.
+No abren un stream WASAPI/COM real: tanto la resolución de device (`sounddevice`) como el
+loopback en sí (`soundcard`) se reemplazan por stubs controlados por el test (mismo enfoque que
+`tests/audio/test_pipeline.py` usa para `sd.rec` en `measure_noise_floor`), así que corren
+rápido, sin hardware de audio, CI-safe. La única pieza que sí corre real es la inicialización de
+COM del thread de fondo (`_init_com_for_this_thread`, sin mockear en los tests de lifecycle): es
+una llamada de sistema barata, sin I/O de audio, y correrla real ejercita el mismo camino que
+producción — la excepción es la sección dedicada a probar esa función en aislamiento, donde sí se
+mockea `ctypes.windll.ole32` para cubrir las ramas de HRESULT sin depender del estado real de COM
+del proceso de test.
 """
 
 from __future__ import annotations
 
 import time
+import types
 from typing import Any, Self
 
 import numpy as np
@@ -31,14 +38,21 @@ def _poll_until(predicate: object, *, timeout: float = POLL_TIMEOUT_SECONDS) -> 
     return bool(predicate())  # type: ignore[operator]
 
 
-class _FakeInputStream:
-    """Stub de `sd.InputStream`: `.read()` devuelve chunks de una lista fija, en orden; agotada
-    la lista, repite el último para siempre (el test corta el thread con `.stop()` antes de que
-    eso importe)."""
+def _float32_chunk_for_int16_level(
+    level: float, *, frames: int = 100, channels: int = 1
+) -> np.ndarray:
+    """Chunk float32 en [-1.0, 1.0] (formato que devuelve `soundcard.Recorder.record`) cuyo RMS,
+    tras escalar a int16 (`loopback._to_int16_scale`, lo que hace `_run_with_com_initialized`
+    antes de comparar contra el threshold), da exactamente `level`."""
+    return np.full((frames, channels), level / loopback._INT16_SCALE, dtype=np.float32)
 
-    def __init__(
-        self, *_args: object, chunks: list[np.ndarray], **_kwargs: object
-    ) -> None:
+
+class _FakeRecorder:
+    """Stub del context manager que devuelve `soundcard`'s `_Microphone.recorder(...)`: `.record()`
+    devuelve chunks de una lista fija, en orden; agotada la lista, repite el último para siempre
+    (el test corta el thread con `.stop()` antes de que eso importe)."""
+
+    def __init__(self, chunks: list[np.ndarray]) -> None:
         self._chunks = list(chunks)
         self._index = 0
         self.entered = False
@@ -50,37 +64,47 @@ class _FakeInputStream:
     def __exit__(self, *_exc: object) -> bool:
         return False
 
-    def read(self, frames: int) -> tuple[np.ndarray, bool]:
+    def record(self, numframes: int) -> np.ndarray:
         if self._index < len(self._chunks):
             chunk = self._chunks[self._index]
             self._index += 1
         elif self._chunks:
             chunk = self._chunks[-1]
         else:
-            chunk = np.zeros(frames, dtype=np.int16)
-        return chunk, False
+            chunk = np.zeros((numframes, 1), dtype=np.float32)
+        return chunk
+
+
+class _FakeLoopbackMic:
+    """Stub de lo que devuelve `soundcard.get_microphone(..., include_loopback=True)`."""
+
+    def __init__(self, chunks: list[np.ndarray]) -> None:
+        self._chunks = chunks
+        self.recorder_kwargs: dict[str, object] | None = None
+
+    def recorder(self, **kwargs: object) -> _FakeRecorder:
+        self.recorder_kwargs = kwargs
+        return _FakeRecorder(self._chunks)
 
 
 def _patch_device_resolution(
-    monkeypatch: pytest.MonkeyPatch, *, device_sr: int = 48_000, channels: int = 2
+    monkeypatch: pytest.MonkeyPatch, *, device_sr: int = 48_000
 ) -> None:
     monkeypatch.setattr(loopback, "resolve_output_device", lambda device: 3)
     monkeypatch.setattr(loopback, "output_sample_rate", lambda device: device_sr)
     monkeypatch.setattr(
-        loopback.sd,
-        "query_devices",
-        lambda device: {"max_output_channels": channels},
+        loopback.sd, "query_devices", lambda device: {"name": "Fake Output Device"}
     )
-    monkeypatch.setattr(loopback.sd, "WasapiSettings", lambda **kwargs: kwargs)
 
 
-def _patch_input_stream(
+def _patch_recorder(
     monkeypatch: pytest.MonkeyPatch, chunks: list[np.ndarray]
-) -> None:
-    def _make_stream(*args: object, **kwargs: object) -> _FakeInputStream:
-        return _FakeInputStream(*args, chunks=chunks, **kwargs)
-
-    monkeypatch.setattr(loopback.sd, "InputStream", _make_stream)
+) -> _FakeLoopbackMic:
+    mic = _FakeLoopbackMic(chunks)
+    monkeypatch.setattr(
+        loopback.sc, "get_microphone", lambda *, id, include_loopback: mic
+    )
+    return mic
 
 
 # --- is_loud / current_level (lógica pura, sin thread) ---------------------------------------
@@ -130,18 +154,18 @@ def test_default_loudness_threshold_is_a_positive_finite_value() -> None:
     assert 0.0 < DEFAULT_LOUDNESS_THRESHOLD < 32_768.0
 
 
-# --- lifecycle: start()/stop() con InputStream stubeado ---------------------------------------
+# --- lifecycle: start()/stop() con `soundcard` stubeado ---------------------------------------
 
 
 def test_start_updates_level_from_stream_and_is_loud_reflects_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Camino feliz: el thread de fondo lee chunks del stream y `is_loud()` termina reflejando
+    """Camino feliz: el thread de fondo lee chunks del recorder y `is_loud()` termina reflejando
     un chunk fuerte."""
     _patch_device_resolution(monkeypatch)
-    quiet = np.full(100, 10, dtype=np.int16)
-    loud = np.full(100, 5000, dtype=np.int16)
-    _patch_input_stream(monkeypatch, [quiet, quiet, loud])
+    quiet = _float32_chunk_for_int16_level(10.0)
+    loud = _float32_chunk_for_int16_level(5000.0)
+    _patch_recorder(monkeypatch, [quiet, quiet, loud])
     monitor = SystemAudioMonitor(threshold=500.0, chunk_seconds=0.01)
 
     monitor.start()
@@ -157,7 +181,7 @@ def test_stop_is_idempotent_and_joins_the_background_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_device_resolution(monkeypatch)
-    _patch_input_stream(monkeypatch, [np.zeros(100, dtype=np.int16)])
+    _patch_recorder(monkeypatch, [np.zeros((100, 1), dtype=np.float32)])
     monitor = SystemAudioMonitor(chunk_seconds=0.01)
 
     monitor.start()
@@ -171,7 +195,7 @@ def test_start_is_idempotent_does_not_spawn_a_second_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_device_resolution(monkeypatch)
-    _patch_input_stream(monkeypatch, [np.zeros(100, dtype=np.int16)])
+    _patch_recorder(monkeypatch, [np.zeros((100, 1), dtype=np.float32)])
     monitor = SystemAudioMonitor(chunk_seconds=0.01)
 
     monitor.start()
@@ -204,18 +228,31 @@ def test_disables_gracefully_when_no_default_output_device(
     assert monitor.is_loud() is False
 
 
-def test_disables_gracefully_when_input_stream_fails_to_open(
+def test_disables_gracefully_when_recorder_fails_to_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """El stream de loopback puede fallar al abrirse (p.ej. conflicto de modo exclusivo) —
-    `PortAudioError` se atrapa y deshabilita el monitor en vez de tumbar el thread con una
-    excepción no manejada."""
+    """El recorder de loopback puede fallar al abrirse (p.ej. conflicto de modo exclusivo,
+    device desconectado) — `soundcard` reporta estos fallos como `RuntimeError` (ver
+    `soundcard.mediafoundation._handle_error`); ese `RuntimeError` se atrapa y deshabilita el
+    monitor en vez de tumbar el thread con una excepción no manejada."""
     _patch_device_resolution(monkeypatch)
 
-    def _raise_port_audio_error(*_args: object, **_kwargs: object) -> Any:
-        raise loopback.sd.PortAudioError("dispositivo ocupado en modo exclusivo")
+    class _FailingRecorder:
+        def __enter__(self) -> Self:
+            raise RuntimeError(
+                "Error 0x88890008"
+            )  # AUDCLNT_E_DEVICE_IN_USE, ejemplo real
 
-    monkeypatch.setattr(loopback.sd, "InputStream", _raise_port_audio_error)
+        def __exit__(self, *_exc: object) -> bool:
+            return False
+
+    class _FailingMic:
+        def recorder(self, **_kwargs: object) -> _FailingRecorder:
+            return _FailingRecorder()
+
+    monkeypatch.setattr(
+        loopback.sc, "get_microphone", lambda *, id, include_loopback: _FailingMic()
+    )
     monitor = SystemAudioMonitor(chunk_seconds=0.01)
 
     monitor.start()
@@ -225,30 +262,19 @@ def test_disables_gracefully_when_input_stream_fails_to_open(
     assert monitor.is_loud() is False
 
 
-def test_disables_gracefully_when_wasapi_settings_rejects_loopback_kwarg(
+def test_disables_gracefully_when_no_matching_loopback_device_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regresión de un bug real (no cubierto por `_patch_device_resolution`, que stubea
-    `sd.WasapiSettings` como un `lambda **kwargs: kwargs` que acepta cualquier cosa): la build de
-    `sounddevice` instalada puede no exponer el kwarg `loopback` en
-    `WasapiSettings.__init__` — confirmado en vivo (`sounddevice==0.5.5`, ver
-    `data/jarvis-error.log`: "TypeError: WasapiSettings.__init__() got an unexpected keyword
-    argument 'loopback'", sin atrapar, tumbando el thread de fondo entero). Antes de este fix,
-    ese `TypeError` no lo atrapaba nada en `_run()` (solo se atrapaba `sd.PortAudioError`) — acá
-    se simula esa construcción real fallando, y el monitor debe degradarse igual que ante un
-    `PortAudioError` al abrir el stream, no crashear el thread."""
-    monkeypatch.setattr(loopback, "resolve_output_device", lambda device: 3)
-    monkeypatch.setattr(loopback, "output_sample_rate", lambda device: 48_000)
-    monkeypatch.setattr(
-        loopback.sd, "query_devices", lambda device: {"max_output_channels": 2}
-    )
+    """`soundcard.get_microphone(id=..., include_loopback=True)` levanta `IndexError` si ningún
+    device de loopback matchea el nombre resuelto por `sounddevice` (p.ej. el device default
+    cambió entre la resolución y la búsqueda, o el nombre truncado por MME no matchea nada) —
+    debe degradar igual que cualquier otro fallo al abrir el loopback, no tumbar el thread."""
+    _patch_device_resolution(monkeypatch)
 
-    def _raise_type_error(**_kwargs: object) -> Any:
-        raise TypeError(
-            "WasapiSettings.__init__() got an unexpected keyword argument 'loopback'"
-        )
+    def _raise_index_error(*, id: str, include_loopback: bool) -> Any:
+        raise IndexError(f"no device with id {id!r}")
 
-    monkeypatch.setattr(loopback.sd, "WasapiSettings", _raise_type_error)
+    monkeypatch.setattr(loopback.sc, "get_microphone", _raise_index_error)
     monitor = SystemAudioMonitor(chunk_seconds=0.01)
 
     monitor.start()
@@ -256,6 +282,94 @@ def test_disables_gracefully_when_wasapi_settings_rejects_loopback_kwarg(
     monitor.stop()
 
     assert monitor.is_loud() is False
+
+
+def test_disables_gracefully_when_com_initialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regresión de un bug real encontrado en vivo (no en logs previos — en la verificación
+    manual de este mismo fix): `soundcard` habla COM, que Windows inicializa por thread, no una
+    sola vez por proceso. `import soundcard` inicializa COM en el thread que hizo el import
+    (normalmente el principal), pero NO en el thread de fondo propio de `SystemAudioMonitor` —
+    sin `_init_com_for_this_thread()` ahí, cada llamada a `soundcard` desde `_run()` fallaba con
+    `RuntimeError('Error 0x800401f0')` (`CO_E_NOTINITIALIZED`), con el monitor deshabilitándose
+    en cada corrida pese a que la captura en sí ya funcionaba. Acá se simula que la
+    inicialización de COM en sí falla, y el monitor debe degradarse igual que ante cualquier otro
+    fallo, no tumbar el thread con una excepción no atrapada."""
+
+    def _raise_oserror() -> bool:
+        raise OSError("CoInitializeEx falló con HRESULT 0x8000ffff")
+
+    monkeypatch.setattr(loopback, "_init_com_for_this_thread", _raise_oserror)
+    monitor = SystemAudioMonitor(chunk_seconds=0.01)
+
+    monitor.start()
+    assert _poll_until(lambda: monitor._disabled)
+    monitor.stop()
+
+    assert monitor.is_loud() is False
+
+
+# --- `_init_com_for_this_thread` en aislamiento (ramas de HRESULT) ----------------------------
+
+
+class _FakeOle32:
+    def __init__(self, hresult: int) -> None:
+        self.hresult = hresult
+        self.co_initialize_calls = 0
+
+    def CoInitializeEx(self, _reserved: object, _coinit: int) -> int:
+        self.co_initialize_calls += 1
+        return self.hresult
+
+    def CoUninitialize(self) -> None:
+        pass
+
+
+def _patch_ole32(monkeypatch: pytest.MonkeyPatch, hresult: int) -> _FakeOle32:
+    fake_ole32 = _FakeOle32(hresult)
+    monkeypatch.setattr(
+        loopback.ctypes, "windll", types.SimpleNamespace(ole32=fake_ole32)
+    )
+    return fake_ole32
+
+
+def test_init_com_for_this_thread_returns_true_on_s_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_ole32(monkeypatch, 0x0)
+
+    assert loopback._init_com_for_this_thread() is True
+
+
+def test_init_com_for_this_thread_returns_true_on_s_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`S_FALSE` (1): COM ya estaba inicializado en este thread con el mismo modelo — sigue
+    siendo "nosotros lo inicializamos" a efectos de este contrato (`True`), ver docstring de
+    `_init_com_for_this_thread`."""
+    _patch_ole32(monkeypatch, 0x1)
+
+    assert loopback._init_com_for_this_thread() is True
+
+
+def test_init_com_for_this_thread_returns_false_on_rpc_e_changed_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """COM ya estaba inicializado en este thread con OTRO modelo de concurrencia por otra
+    librería — usable, pero no lo inicializamos nosotros, así que no hay que desinicializarlo."""
+    _patch_ole32(monkeypatch, 0x80010106)
+
+    assert loopback._init_com_for_this_thread() is False
+
+
+def test_init_com_for_this_thread_raises_oserror_on_unexpected_hresult(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_ole32(monkeypatch, 0x8000FFFF)  # E_UNEXPECTED, HRESULT de falla arbitrario
+
+    with pytest.raises(OSError):
+        loopback._init_com_for_this_thread()
 
 
 # --- thread-safety -----------------------------------------------------------------------------

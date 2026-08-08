@@ -6,11 +6,15 @@ requires-python = ">=3.12"
 dependencies = [
     "openwakeword>=0.6",
     "sounddevice>=0.4",
+    "soundcard>=0.4",  # loopback WASAPI real (jarvis.audio.loopback) — sounddevice/PortAudio no
+    # soporta loopback (feature request abierta: spatialaudio/python-sounddevice#281)
     "numpy>=1.26",
     "openai>=1.0",
     "httpx>=0.27",
     "pyttsx3>=2.90",
     "playsound3>=3.0",
+    "psutil>=6.0",  # system_info: CPU/RAM sin WMI verboso/inestable (jarvis.tools.system_info)
+    "Pillow>=10.0",  # screenshot: PIL.ImageGrab sin GDI a mano via ctypes (jarvis.tools.screenshot)
 ]
 
 [project.optional-dependencies]
@@ -18,6 +22,7 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pytest>=8.3",
+    "types-psutil>=6.0",  # stubs para psutil bajo mypy --strict (jarvis.tools.system_info)
 ]
 
 [build-system]
@@ -32,7 +37,7 @@ python_version = "3.12"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["sounddevice", "openwakeword.*", "pyttsx3.*", "playsound3.*"]
+module = ["sounddevice", "soundcard", "openwakeword.*", "pyttsx3.*", "playsound3.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

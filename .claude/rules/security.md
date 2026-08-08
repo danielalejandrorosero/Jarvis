@@ -13,7 +13,12 @@ acción pasa por clasificación antes de ejecutarse.
 
 **SAFE** — se ejecuta sin confirmación.
 Lectura, consultas, listar procesos/archivos, abrir aplicaciones, abrir URLs, información del
-sistema. No muta estado persistente.
+sistema. No muta estado persistente **del usuario o del sistema operativo**. Excepción explícita:
+escribir en el store SQLite interno de JARVIS (p.ej. `facts`, `reminders` en
+`jarvis.memory.store`) cuenta como SAFE — es estado propio de JARVIS, no un archivo/proceso/
+configuración del usuario, reversible y de impacto acotado al propio asistente. Esta excepción no
+se extiende a operaciones de borrado masivo o irreversibles sobre ese mismo store (eso es CONFIRM
+o DANGEROUS según impacto).
 
 **CONFIRM** — requiere confirmación explícita del usuario antes de ejecutar.
 Modificar archivos, instalar software, modificar configuración, terminar procesos, operaciones

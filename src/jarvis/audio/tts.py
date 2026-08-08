@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Protocol
 
@@ -112,3 +113,44 @@ class FallbackTTSClient:
 def load_default_tts_client() -> TTSClient:
     """Cliente TTS con el contrato de ADR-0004: OpenAI TTS primario, SAPI de fallback."""
     return FallbackTTSClient(primary=OpenAITTSClient(), fallback=SapiTTSClient())
+
+
+class LockingTTSClient:
+    """Envuelve otro `TTSClient` serializando llamadas a `.speak()` con un `threading.Lock`.
+
+    Hasta la introducción de `jarvis.audio.timer_scheduler.TimerScheduler`, todo llamador de
+    `speak()` en este codebase quedaba, de hecho, serializado — `VoiceConfirmationChannel.ask()`
+    lo llama vía `asyncio.to_thread` desde un thread aparte, pero siempre *dentro* de un
+    `await` que el loop de `dispatch_turn`/`run()` espera antes de seguir, así que dos llamadas a
+    `speak()` nunca corrían de verdad al mismo tiempo. `TimerScheduler` rompe ese supuesto: es un
+    thread de fondo genuinamente independiente que puede llamar `tts.speak()` en cualquier
+    momento, incluso mientras el loop principal está a mitad de decir otra cosa.
+
+    No hay evidencia concreta de que las implementaciones de `TTSClient` de este módulo se rompan
+    con llamadas concurrentes (`OpenAITTSClient.speak` escribe a un archivo temporal *propio* por
+    llamada — `tempfile.TemporaryDirectory()` por invocación, sin colisión de paths — y
+    `playsound3.playsound()` bloquea hasta terminar su propia reproducción; probablemente ambas
+    llamadas simplemente reproducirían audio superpuesto en vez de fallar). El riesgo real y
+    concreto es distinto: `SapiTTSClient.speak()` crea un `pyttsx3.init()` nuevo por llamada, y
+    SAPI vía COM en Windows no está garantizado thread-safe sin inicialización explícita de
+    apartment por thread — dos `speak()` concurrentes cayendo al fallback local podrían
+    interferir entre sí de formas no obvias. Sin haber podido confirmar esto en vivo (haría falta
+    forzar el fallback dos veces en simultáneo), este wrapper es la mitigación barata: un lock
+    global sobre la reproducción real hace que "concurrente" se convierta en "en cola, uno
+    después del otro" — nunca simultáneo — a costo de que un anuncio de timer/recordatorio pueda
+    esperar a que termine de hablar lo que esté sonando en ese momento, que es exactamente el
+    comportamiento esperado (dos voces superpuestas serían peor experiencia que una cola corta).
+
+    Usado en `jarvis.audio.pipeline.run()` envolviendo el `TTSClient` que ya devuelve
+    `load_default_tts_client()` — nunca cambia el tipo que devuelve esa función (no rompe
+    `test_load_default_tts_client_returns_a_fallback_tts_client`), la envoltura se aplica en el
+    punto de uso.
+    """
+
+    def __init__(self, *, inner: TTSClient, lock: threading.Lock | None = None) -> None:
+        self._inner = inner
+        self._lock = lock if lock is not None else threading.Lock()
+
+    def speak(self, text: str) -> None:
+        with self._lock:
+            self._inner.speak(text)
