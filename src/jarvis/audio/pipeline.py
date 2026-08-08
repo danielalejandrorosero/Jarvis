@@ -18,7 +18,7 @@ import sounddevice as sd
 
 from jarvis.audio.device import input_sample_rate, resolve_input_device
 from jarvis.audio.resample import resample
-from jarvis.audio.stt import load_whisper_model, transcribe
+from jarvis.audio.stt import load_stt_client, transcribe
 from jarvis.audio.tts import TTSClient, load_default_tts_client
 from jarvis.audio.wake_word import (
     DEFAULT_THRESHOLD,
@@ -42,7 +42,15 @@ CHUNK_SECONDS = (
 TRAILING_SILENCE_SECONDS = (
     1.2  # cuánto silencio sostenido después de hablar antes de cortar solo
 )
-NOISE_FLOOR_SAMPLE_SECONDS = 1.0  # cuánto se mide de ambiente al arrancar para calibrar
+NOISE_FLOOR_SAMPLE_SECONDS = 1.5  # cuánto se mide de ambiente al arrancar para calibrar
+NOISE_FLOOR_SUBCHUNKS = (
+    5  # partir la medición en sub-chunks y usar la mediana del RMS, no el
+)
+# RMS de la ventana entera. Confirmado en vivo: un ruido puntual justo al arrancar la
+# calibración (el usuario todavía terminando de hablar, un clic, etc.) infla el RMS de toda la
+# ventana y el umbral de silencio queda desproporcionado (llegó a calibrar en 17752, casi la
+# mitad del rango de int16) — la mediana ignora ese pico puntual mientras siga siendo un solo
+# sub-chunk de varios.
 NOISE_FLOOR_MULTIPLIER = (
     4.0  # el umbral de silencio/voz se calibra a piso_de_ruido * esto
 )
@@ -100,7 +108,8 @@ def measure_noise_floor(
     resampled = resample(
         np.asarray(audio.reshape(-1)), orig_sr=device_sr, target_sr=SAMPLE_RATE
     )
-    return chunk_rms(resampled)
+    subchunks = np.array_split(resampled, NOISE_FLOOR_SUBCHUNKS)
+    return float(np.median([chunk_rms(chunk) for chunk in subchunks]))
 
 
 def calibrate_thresholds(noise_floor: float) -> float:
@@ -209,20 +218,14 @@ def run(
     threshold: float = DEFAULT_THRESHOLD,
     device: int | None = None,
     duration: float | None = None,
-    stt_device: str = "cuda",
 ) -> None:
     """Escuchar la wake word; al detectarla, grabar un comando y transcribirlo.
 
     Corre hasta Ctrl+C, o hasta que pasen `duration` segundos totales si se especifica.
-
-    `stt_device` default "cuda" a nivel de esta app (no de la librería `stt.py`, que por
-    defecto usa CPU): confirmado funcionando en esta máquina con una RTX 3050 + los paquetes
-    pip `nvidia-cublas-cu12`/`nvidia-cudnn-cu12`. Si no están instalados o la GPU falla, pasar
-    `--stt-device cpu` explícitamente.
     """
     load_dotenv()
     wake_model = load_wake_word_model()
-    whisper_model = load_whisper_model(device=stt_device)
+    stt_client = load_stt_client()
     llm: LLMClient = load_deepseek_client_from_env()
     tts: TTSClient = load_default_tts_client()
 
@@ -265,11 +268,11 @@ def run(
             command_audio = record_command(
                 device=device, silence_threshold=silence_threshold, pre_roll=pre_roll
             )
-            text = transcribe(command_audio, model=whisper_model)
+            text = transcribe(command_audio, client=stt_client)
             print(f"Dijiste: {text!r}")
             if not text.strip():
-                # Whisper puede "alucinar" frases sobre silencio puro (confirmado en esta fase);
-                # no tiene sentido gastar una llamada al LLM sobre texto vacío.
+                # El modelo de transcripción puede devolver vacío sobre silencio puro; no tiene
+                # sentido gastar una llamada al LLM sobre texto vacío.
                 print("(nada que responder, no se detectó habla real)", file=sys.stderr)
             else:
                 reply = llm.complete(text, system=SYSTEM_PROMPT)
@@ -299,20 +302,8 @@ def main() -> None:
         default=None,
         help="Segundos totales de escucha (default: infinito, Ctrl+C)",
     )
-    parser.add_argument(
-        "--stt-device",
-        type=str,
-        default="cuda",
-        choices=["cuda", "cpu"],
-        help="Dispositivo para Whisper (default: cuda)",
-    )
     args = parser.parse_args()
-    run(
-        threshold=args.threshold,
-        device=args.device,
-        duration=args.duration,
-        stt_device=args.stt_device,
-    )
+    run(threshold=args.threshold, device=args.device, duration=args.duration)
 
 
 if __name__ == "__main__":

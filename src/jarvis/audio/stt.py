@@ -1,85 +1,59 @@
-"""Transcripción de audio a texto con faster-whisper.
+"""Transcripción de audio a texto vía la API de OpenAI (`gpt-4o-transcribe`).
 
 Alcance de esta fase: transcribir un clip de audio ya grabado (después de detectar la wake
 word). Nada de LLM ni TTS todavía (ADR-0004).
+
+Reemplaza el Whisper local (`faster-whisper`): en pruebas en vivo, la API entendió correctamente
+audio que el modelo local ("medium", GPU) devolvió vacío — más robusta ante audio no perfecto.
+Depende de red y de `OPENAI_API_KEY` (ver `.env.example`).
 """
 
 from __future__ import annotations
 
-import importlib.util
-import os
+import io
+import wave
 
 import numpy as np
-from faster_whisper import WhisperModel
+from openai import Omit, OpenAI
 
-MODEL_SIZE = "medium"
+MODEL = "gpt-4o-transcribe"
 LANGUAGE = "es"
+# Hint de vocabulario: la API lo usa para sesgar ortografía/reconocimiento de palabras
+# ambiguas, no cambia el idioma de salida. Confirmado en vivo que "Jarvis" se transcribe mal
+# de formas distintas cada vez ("Jorvis", "Garbis", "Garrechu") — es un nombre propio en
+# inglés dentro de una frase en español, justo el caso que este hint corrige.
+PROMPT = "JARVIS es un asistente de voz."
 
 
-def _register_cuda_dll_dirs() -> None:
-    """Registrar los directorios `bin/` de los paquetes pip `nvidia-cublas-cu12` /
-    `nvidia-cudnn-cu12`, si están instalados, para que ctranslate2 (backend de faster-whisper)
-    encuentre `cublas64_12.dll` y `cudnn64_9.dll` en runtime.
-
-    Sin esto, `device="cuda"` construye el modelo sin error (la construcción no toca cuBLAS) pero
-    falla recién en `transcribe()` con "cublas64_12.dll is not found" — Windows no busca DLLs de
-    dependencias en site-packages por default. No hace falta el instalador pesado de CUDA
-    Toolkit: estos paquetes pip traen las DLLs necesarias.
-
-    Usa `os.environ["PATH"]`, no `os.add_dll_directory()`: ese mecanismo solo cubre la carga de
-    módulos de extensión de Python (.pyd), pero ctranslate2 es una librería nativa que resuelve
-    sus propias dependencias (cuBLAS/cuDNN) vía el PATH real del proceso — confirmado
-    empíricamente, `add_dll_directory` no alcanza acá. No-op silencioso si los paquetes no están
-    instalados (entonces `device="cuda"` falla igual que antes, con el mismo error explícito —
-    este helper no lo esconde).
-    """
-    dirs_to_add = []
-    for pkg in ("nvidia.cublas", "nvidia.cudnn"):
-        spec = importlib.util.find_spec(pkg)
-        if spec is None or not spec.submodule_search_locations:
-            continue
-        bin_dir = os.path.join(spec.submodule_search_locations[0], "bin")
-        if os.path.isdir(bin_dir):
-            dirs_to_add.append(bin_dir)
-    if dirs_to_add:
-        os.environ["PATH"] = os.pathsep.join([*dirs_to_add, os.environ.get("PATH", "")])
-
-
-def load_whisper_model(
-    *, device: str = "cpu", compute_type: str | None = None
-) -> WhisperModel:
-    """Cargar el modelo Whisper.
-
-    Default CPU porque siempre funciona sin dependencias extra. `device="cuda"` usa la GPU si
-    `nvidia-cublas-cu12`/`nvidia-cudnn-cu12` están instalados (`pip install`, no requiere el
-    instalador de CUDA Toolkit) — confirmado funcionando en esta máquina con una RTX 3050.
-    """
-    if device == "cuda":
-        _register_cuda_dll_dirs()
-    resolved_compute_type = compute_type or ("float16" if device == "cuda" else "int8")
-    return WhisperModel(MODEL_SIZE, device=device, compute_type=resolved_compute_type)
+def load_stt_client() -> OpenAI:
+    """Cliente de transcripción. Lee `OPENAI_API_KEY` del entorno (cargado por `config.load_dotenv()`)."""
+    return OpenAI()
 
 
 def transcribe(
     audio: np.ndarray,
     *,
-    model: WhisperModel,
+    client: OpenAI,
     sample_rate: int = 16_000,
     language: str | None = LANGUAGE,
 ) -> str:
-    """Transcribir audio int16 mono a texto plano. Concatena todos los segmentos detectados.
+    """Transcribir audio int16 mono a texto plano vía la API de OpenAI.
 
-    `sample_rate` es solo una validación de contrato: WhisperModel.transcribe() no acepta un
-    sampling_rate configurable cuando se le pasa un ndarray — asume el fijo del modelo (16kHz),
-    tomado de `model.feature_extractor.sampling_rate`. Pasar audio a otra tasa lo transcribe mal
-    en silencio, sin error — por eso esta función lo valida explícitamente en vez de confiar en
-    que quien llama ya lo sabe.
+    Empaqueta el audio como WAV en memoria (la API espera un archivo, no un array crudo) y le
+    pone `.name` porque el SDK de OpenAI usa la extensión del nombre para el content-type.
     """
-    if sample_rate != model.feature_extractor.sampling_rate:
-        raise ValueError(
-            f"sample_rate={sample_rate} no coincide con el sampling_rate del modelo "
-            f"({model.feature_extractor.sampling_rate}); el audio se transcribiría mal en silencio."
-        )
-    audio_float = audio.astype(np.float32) / 32768.0
-    segments, _info = model.transcribe(audio_float, language=language)
-    return " ".join(segment.text.strip() for segment in segments).strip()
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(audio.tobytes())
+    buffer.seek(0)
+    buffer.name = "audio.wav"
+    result = client.audio.transcriptions.create(
+        model=MODEL,
+        file=buffer,
+        language=language if language is not None else Omit(),
+        prompt=PROMPT,
+    )
+    return result.text.strip()

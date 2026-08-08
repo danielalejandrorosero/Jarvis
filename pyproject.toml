@@ -7,7 +7,6 @@ dependencies = [
     "openwakeword>=0.6",
     "sounddevice>=0.4",
     "numpy>=1.26",
-    "faster-whisper>=1.2",
     "openai>=1.0",
     "edge-tts>=7.0",
     "pyttsx3>=2.90",
@@ -19,11 +18,6 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pytest>=8.3",
-]
-# Solo necesario para load_whisper_model(device="cuda"). CPU (default) no requiere esto.
-gpu = [
-    "nvidia-cublas-cu12",
-    "nvidia-cudnn-cu12",
 ]
 
 [build-system]
@@ -38,7 +32,7 @@ python_version = "3.12"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["sounddevice", "openwakeword.*", "faster_whisper.*", "edge_tts.*", "pyttsx3.*", "playsound3.*"]
+module = ["sounddevice", "openwakeword.*", "edge_tts.*", "pyttsx3.*", "playsound3.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -1,116 +1,153 @@
 """Tests para el núcleo puro de transcripción de audio a texto (`transcribe`).
 
-No cargan el modelo real de Whisper (`load_whisper_model`): `transcribe()` recibe un modelo
-faster-whisper stub, controlado por el test, así que corren rápido, sin red y sin descargar
-pesos del modelo (CI-safe).
+No pegan a la API real de OpenAI (`load_stt_client`): `transcribe()` recibe un cliente `OpenAI`
+stub, controlado por el test, cuyo `.audio.transcriptions.create()` está mockeado (mismo enfoque
+que `tests/test_llm_client.py`/`tests/audio/test_wake_word.py`: núcleo puro con dependencia
+externa stubeada), así que corren rápido, sin red y sin `OPENAI_API_KEY` real (CI-safe).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from typing import cast
+import wave
+from typing import Any, cast
 
 import numpy as np
-import pytest
-from faster_whisper import WhisperModel
+from openai import Omit, OpenAI
 
+from jarvis.audio import stt
 from jarvis.audio.stt import transcribe
 
 SAMPLE_RATE = 16_000
 
 
-class _FakeSegment:
-    """Stub de un segmento de `faster_whisper`: solo expone `.text`, lo único que usa `transcribe()`."""
+class _FakeTranscription:
+    """Stub de la respuesta de `client.audio.transcriptions.create()`: solo expone `.text`, lo
+    único que usa `transcribe()`."""
 
     def __init__(self, text: str) -> None:
         self.text = text
 
 
-class _FakeFeatureExtractor:
-    def __init__(self, sampling_rate: int) -> None:
-        self.sampling_rate = sampling_rate
+class _FakeTranscriptions:
+    """Stub de `client.audio.transcriptions`.
 
-
-class _FakeWhisperModel:
-    """Stub de `faster_whisper.WhisperModel`.
-
-    `.transcribe()` devuelve segmentos predefinidos y registra con qué audio/idioma fue
-    llamado en `.calls`, para poder inspeccionarlo desde el test (spy) sin cargar un modelo real.
+    `.create()` devuelve una respuesta predefinida y registra con qué kwargs fue llamada en
+    `.calls`, para poder inspeccionarla desde el test (spy) sin pegarle a la red real.
     """
 
-    def __init__(self, segments: Iterable[_FakeSegment], sampling_rate: int = SAMPLE_RATE) -> None:
-        self.feature_extractor = _FakeFeatureExtractor(sampling_rate)
-        self._segments = segments
-        self.calls: list[tuple[np.ndarray, str | None]] = []
+    def __init__(self, response: _FakeTranscription) -> None:
+        self._response = response
+        self.calls: list[dict[str, Any]] = []
 
-    def transcribe(self, audio: np.ndarray, *, language: str | None = None) -> tuple[Iterable[_FakeSegment], None]:
-        self.calls.append((audio, language))
-        return self._segments, None
-
-
-def _model_with(segments: Iterable[_FakeSegment], sampling_rate: int = SAMPLE_RATE) -> WhisperModel:
-    # El stub no implementa la superficie completa de WhisperModel, solo lo que `transcribe()`
-    # usa (`.feature_extractor.sampling_rate` y `.transcribe()`). Se castea para satisfacer la
-    # firma de `transcribe(..., model: WhisperModel)`.
-    return cast(WhisperModel, _FakeWhisperModel(segments, sampling_rate=sampling_rate))
+    def create(self, **kwargs: Any) -> _FakeTranscription:
+        self.calls.append(kwargs)
+        return self._response
 
 
-def test_transcribe_joins_segment_texts_stripped_with_spaces() -> None:
-    """Caso aceptado: varios segmentos con texto se concatenan con espacios, cada uno stripeado."""
-    segments = [
-        _FakeSegment("  Hola  "),
-        _FakeSegment("cómo estás\n"),
-        _FakeSegment("\tbien"),
-    ]
-    model = _model_with(segments)
+class _FakeAudio:
+    def __init__(self, transcriptions: _FakeTranscriptions) -> None:
+        self.transcriptions = transcriptions
+
+
+class _FakeOpenAIClient:
+    """Stub de `openai.OpenAI`: solo expone `.audio.transcriptions`, lo único que usa
+    `transcribe()`."""
+
+    def __init__(self, response: _FakeTranscription) -> None:
+        self.audio = _FakeAudio(_FakeTranscriptions(response))
+
+
+def _client_with(text: str) -> tuple[OpenAI, _FakeTranscriptions]:
+    # El stub no implementa la superficie completa de OpenAI, solo lo que `transcribe()` usa
+    # (`.audio.transcriptions.create()`). Se castea para satisfacer la firma de
+    # `transcribe(..., client: OpenAI)`.
+    fake_client = _FakeOpenAIClient(_FakeTranscription(text))
+    return cast(OpenAI, fake_client), fake_client.audio.transcriptions
+
+
+def test_transcribe_returns_stripped_result_text() -> None:
+    """Caso aceptado: el `.text` de la respuesta de la API se devuelve stripeado."""
+    client, _spy = _client_with("  hola cómo estás  \n")
     audio = np.zeros(SAMPLE_RATE, dtype=np.int16)
 
-    result = transcribe(audio, model=model, sample_rate=SAMPLE_RATE)
+    result = transcribe(audio, client=client, sample_rate=SAMPLE_RATE)
 
-    assert result == "Hola cómo estás bien"
+    assert result == "hola cómo estás"
 
 
-def test_transcribe_returns_empty_string_when_no_segments_detected() -> None:
-    """Silencio / sin voz detectada: `model.transcribe()` no produce segmentos, no es un error."""
-    model = _model_with([])
+def test_transcribe_returns_empty_string_when_result_text_is_blank() -> None:
+    """Silencio / sin voz detectada: la API puede devolver texto vacío o solo espacios, no es
+    un error, `transcribe()` simplemente devuelve el string (stripeado, posiblemente vacío)."""
+    client, _spy = _client_with("   ")
     audio = np.zeros(SAMPLE_RATE, dtype=np.int16)
 
-    result = transcribe(audio, model=model, sample_rate=SAMPLE_RATE)
+    result = transcribe(audio, client=client, sample_rate=SAMPLE_RATE)
 
     assert result == ""
 
 
-def test_transcribe_raises_value_error_on_sample_rate_mismatch() -> None:
-    """Caso rechazado: un sample_rate que no coincide con el del modelo debe fallar explícito,
-    en vez de transcribir mal en silencio."""
-    model = _model_with([_FakeSegment("no debería usarse")], sampling_rate=16_000)
-    audio = np.zeros(8_000, dtype=np.int16)
-
-    with pytest.raises(ValueError, match="sample_rate"):
-        transcribe(audio, model=model, sample_rate=8_000)
-
-
-def test_transcribe_normalizes_int16_audio_to_float32_unit_range() -> None:
-    """El audio int16 se normaliza a float32 en aproximadamente [-1, 1] antes de pasarlo al modelo."""
-    fake_model = _FakeWhisperModel([_FakeSegment("ok")])
-    model = cast(WhisperModel, fake_model)
-    audio = np.array([32767, -32768, 0], dtype=np.int16)
-
-    transcribe(audio, model=model, sample_rate=SAMPLE_RATE)
-
-    assert len(fake_model.calls) == 1
-    called_audio, _language = fake_model.calls[0]
-    assert called_audio.dtype == np.float32
-    np.testing.assert_allclose(called_audio, [1.0, -1.0, 0.0], atol=1e-4)
-
-
-def test_transcribe_passes_language_through_to_model() -> None:
-    """El parámetro `language` (incluyendo el default "es") se reenvía tal cual a `model.transcribe()`."""
-    fake_model = _FakeWhisperModel([_FakeSegment("hola")])
-    model = cast(WhisperModel, fake_model)
+def test_transcribe_passes_default_language_through_to_create() -> None:
+    """El parámetro `language` (default "es") se reenvía tal cual a `create()`."""
+    client, spy = _client_with("ok")
     audio = np.zeros(4, dtype=np.int16)
 
-    transcribe(audio, model=model, sample_rate=SAMPLE_RATE)
-    transcribe(audio, model=model, sample_rate=SAMPLE_RATE, language=None)
+    transcribe(audio, client=client, sample_rate=SAMPLE_RATE)
 
-    assert [language for _audio, language in fake_model.calls] == ["es", None]
+    assert len(spy.calls) == 1
+    assert spy.calls[0]["language"] == "es"
+
+
+def test_transcribe_passes_explicit_language_through_to_create() -> None:
+    """Un `language` explícito (distinto del default) también se reenvía tal cual."""
+    client, spy = _client_with("ok")
+    audio = np.zeros(4, dtype=np.int16)
+
+    transcribe(audio, client=client, sample_rate=SAMPLE_RATE, language="en")
+
+    assert spy.calls[0]["language"] == "en"
+
+
+def test_transcribe_with_language_none_sends_omit_instead_of_string() -> None:
+    """`language=None`: `create()` recibe un `Omit()` (para dejar que la API autodetecte el
+    idioma), nunca el string `"es"` del default ni el literal `None`."""
+    client, spy = _client_with("ok")
+    audio = np.zeros(4, dtype=np.int16)
+
+    transcribe(audio, client=client, sample_rate=SAMPLE_RATE, language=None)
+
+    sent_language = spy.calls[0]["language"]
+    assert isinstance(sent_language, Omit)
+
+
+def test_transcribe_sends_model_kwarg() -> None:
+    """El modelo enviado a `create()` es el configurado en el módulo (`stt.MODEL`), no hardcodeado
+    acá, para no tener que tocar este test cada vez que se cambie de modelo."""
+    client, spy = _client_with("ok")
+    audio = np.zeros(4, dtype=np.int16)
+
+    transcribe(audio, client=client, sample_rate=SAMPLE_RATE)
+
+    assert spy.calls[0]["model"] == stt.MODEL
+
+
+def test_transcribe_packages_audio_as_valid_wav_with_correct_format() -> None:
+    """El audio se empaqueta como un WAV válido (mono, 16-bit, con el sample_rate pedido) antes
+    de enviarlo, y el archivo tiene un `.name` terminado en `.wav` (el SDK de OpenAI lo usa para
+    inferir el content-type)."""
+    client, spy = _client_with("ok")
+    audio = np.array([100, -100, 32767, -32768, 0], dtype=np.int16)
+    sample_rate = 22_050
+
+    transcribe(audio, client=client, sample_rate=sample_rate)
+
+    sent_file = spy.calls[0]["file"]
+    assert sent_file.name.endswith(".wav")
+
+    sent_file.seek(0)
+    with wave.open(sent_file, "rb") as wf:
+        assert wf.getnchannels() == 1
+        assert wf.getsampwidth() == 2
+        assert wf.getframerate() == sample_rate
+        assert wf.getnframes() == len(audio)
+        frames = wf.readframes(wf.getnframes())
+        assert np.frombuffer(frames, dtype=np.int16).tolist() == audio.tolist()
