@@ -58,11 +58,7 @@ def test_load_dotenv_skips_blank_comment_and_malformed_lines(tmp_path: Path) -> 
     lanzar excepción y sin agregar claves espurias."""
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "\n"
-        "# esto es un comentario\n"
-        "sin_signo_igual\n"
-        "REAL=value\n"
-        "   \n",
+        "\n# esto es un comentario\nsin_signo_igual\nREAL=value\n   \n",
         encoding="utf-8",
     )
     keys_before = set(os.environ.keys())
@@ -73,7 +69,9 @@ def test_load_dotenv_skips_blank_comment_and_malformed_lines(tmp_path: Path) -> 
     assert set(os.environ.keys()) - keys_before == {"REAL"}
 
 
-def test_load_dotenv_does_not_override_already_set_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_dotenv_does_not_override_already_set_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Una variable ya presente en os.environ (p. ej. exportada manualmente) siempre gana sobre
     el valor del archivo."""
     monkeypatch.setenv("FOO", "original")

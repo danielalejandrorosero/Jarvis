@@ -83,7 +83,9 @@ def test_speak_does_not_propagate_primary_exception() -> None:
     client.speak("no debería propagar")
 
 
-def test_speak_does_not_call_fallback_when_fallback_would_also_fail_but_primary_succeeds() -> None:
+def test_speak_does_not_call_fallback_when_fallback_would_also_fail_but_primary_succeeds() -> (
+    None
+):
     """Confirma que el éxito del primario evita tocar el fallback incluso si el fallback está
     configurado para fallar: la lógica no llama al fallback "por las dudas"."""
     primary = _FakeTTSClient()

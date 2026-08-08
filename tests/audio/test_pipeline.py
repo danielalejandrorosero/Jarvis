@@ -1,20 +1,25 @@
 """Tests para el núcleo puro del pipeline de voz (`jarvis.audio.pipeline`).
 
 Cubre las funciones que no dependen de hardware/red (`chunk_rms`, `calibrate_thresholds`,
-`normalize_gain`, `should_stop_recording`, `tee_frames`) sin mocks, y `measure_noise_floor` —
-la única con I/O real (`sd.rec`/`sd.wait`, resolución de dispositivo) — mockeando esos puntos de
-entrada explícitamente (mismo enfoque que el resto de `tests/audio/`: núcleo puro con
-dependencias externas stubeadas, CI-safe, sin hardware ni red).
+`normalize_gain`, `should_stop_recording`, `tee_frames`, `_is_affirmative`, `dispatch_turn`) sin
+mocks de hardware, y `measure_noise_floor` — la única con I/O real (`sd.rec`/`sd.wait`,
+resolución de dispositivo) — mockeando esos puntos de entrada explícitamente (mismo enfoque que
+el resto de `tests/audio/`: núcleo puro con dependencias externas stubeadas, CI-safe, sin
+hardware ni red).
 
 `record_command()` y `run()` no se testean acá: son wrappers finos de integración sobre
 `sd.InputStream`/modelos reales sin lógica propia además de la ya cubierta por las funciones de
 este archivo (mismo criterio que el repo ya aplica a funciones con forma de
-`iter_microphone_frames`/`record_command`: integración, no unit test).
+`iter_microphone_frames`/`record_command`: integración, no unit test). `dispatch_turn` sí se
+testea acá con un `LLMClient`/`PolicyEngine` de prueba — no depende de hardware, solo de esas dos
+interfaces swappable.
 """
 
 from __future__ import annotations
 
 from collections import deque
+from typing import Any, ClassVar
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -33,6 +38,10 @@ from jarvis.audio.pipeline import (
     should_stop_recording,
     tee_frames,
 )
+from jarvis.llm.client import LLMResult, ToolCall
+from jarvis.security.policy import PolicyEngine
+from jarvis.tools.base import RiskLevel, Tool
+from jarvis.tools.weather import WeatherTool
 
 # --- chunk_rms -----------------------------------------------------------------------------
 
@@ -293,3 +302,172 @@ def test_measure_noise_floor_passes_resolved_device_and_sample_rate_to_sd_rec(
     assert calls[0]["count"] == samples
     assert calls[0]["samplerate"] == device_sr
     assert calls[0]["device"] == 7
+
+
+# --- _is_affirmative -------------------------------------------------------------------------
+# Regresión de un hallazgo de `security-reviewer` sobre ADR-0005: la primera versión aprobaba
+# "sí" con solo buscar una palabra afirmativa en cualquier parte del texto, lo que daba falsos
+# positivos sobre negaciones ("no, dale un momento..." contiene "dale"). Rompía el contrato de
+# ADR-0004 ("silencio o ambigüedad ⇒ denegar por defecto") — una respuesta semánticamente
+# negativa podía autorizar una acción CONFIRM.
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("", False),
+        ("   ", False),
+        ("sí", True),
+        ("Sí.", True),
+        ("si", True),
+        ("dale", True),
+        ("confirmo", True),
+        ("sí, confirmo", True),
+        ("no", False),
+        ("no, dale un momento, dejame pensar", False),  # el caso exacto del hallazgo
+        ("dale, no", False),
+        ("no confirmo", False),
+        ("nunca", False),
+        ("pará, todavía no", False),
+        ("bueno dale", False),  # "bueno" no reconocido: ambigüedad -> denegar
+        ("quiero un café", False),
+    ],
+)
+def test_is_affirmative(text: str, expected: bool) -> None:
+    assert pipeline._is_affirmative(text) is expected
+
+
+# --- dispatch_turn ---------------------------------------------------------------------------
+
+
+class _ScriptedLLMClient:
+    """`LLMClient` de prueba: devuelve una secuencia fija de `LLMResult`, uno por llamada a
+    `complete()`, para scriptear un intercambio LLM ↔ tool-call determinístico sin red. También
+    registra los `messages` de cada llamada (spy), para poder verificar qué se le mandó de
+    vuelta al LLM tras ejecutar (o denegar) un tool."""
+
+    def __init__(self, results: list[LLMResult]) -> None:
+        self._results = iter(results)
+        self.calls: list[list[dict[str, Any]]] = []
+
+    def complete(
+        self, messages: list[dict[str, Any]], *, tools: object = None
+    ) -> LLMResult:
+        self.calls.append(messages)
+        return next(self._results)
+
+
+class _StubTool(Tool):
+    """Tool SAFE de prueba: devuelve un resultado fijo derivado de sus `kwargs`, sin red."""
+
+    name = "get_weather"
+    description = "tool de prueba"
+    parameters: ClassVar[dict[str, Any]] = {}
+    risk = RiskLevel.SAFE
+
+    async def execute(self, **kwargs: Any) -> str:
+        return f"clima de {kwargs['city']}: soleado"
+
+
+def test_dispatch_turn_returns_text_directly_when_llm_requests_no_tool_call() -> None:
+    """Sin tool-call, `dispatch_turn` se comporta como un `complete()` de una sola pasada."""
+    llm = _ScriptedLLMClient(
+        [LLMResult(text="hola, ¿en qué te ayudo?", tool_call=None)]
+    )
+    policy = MagicMock(spec=PolicyEngine)
+
+    reply = pipeline.dispatch_turn(
+        "hola", llm=llm, tools={}, tool_schemas=[], policy=policy
+    )
+
+    assert reply == "hola, ¿en qué te ayudo?"
+    policy.authorize_and_execute.assert_not_called()
+
+
+def test_dispatch_turn_executes_tool_via_policy_and_returns_final_llm_text() -> None:
+    """Camino feliz: un tool-call válido se autoriza/ejecuta vía `PolicyEngine` (real, con un
+    `ConfirmationChannel` de prueba), su resultado se le devuelve al LLM como mensaje
+    `role: tool`, y la segunda respuesta del LLM es lo que se devuelve."""
+    tool = _StubTool()
+    good_call = ToolCall(id="call_1", name="get_weather", arguments={"city": "Madrid"})
+    llm = _ScriptedLLMClient(
+        [
+            LLMResult(text="", tool_call=good_call),
+            LLMResult(text="En Madrid está soleado.", tool_call=None),
+        ]
+    )
+
+    class _AlwaysDenyChannel:
+        async def ask(self, prompt: str) -> bool:
+            return False
+
+    policy = PolicyEngine(_AlwaysDenyChannel())
+
+    reply = pipeline.dispatch_turn(
+        "clima en Madrid",
+        llm=llm,
+        tools={tool.name: tool},
+        tool_schemas=[],
+        policy=policy,
+    )
+
+    assert reply == "En Madrid está soleado."
+    tool_message = llm.calls[1][-1]
+    assert tool_message["role"] == "tool"
+    assert tool_message["content"] == "clima de Madrid: soleado"
+
+
+def test_dispatch_turn_feeds_arguments_error_back_to_llm_without_calling_policy() -> (
+    None
+):
+    """Regresión del hallazgo #2 de `security-reviewer`: argumentos de tool-call malformados
+    (JSON inválido, o JSON válido pero no un objeto) nunca llegan a `PolicyEngine`/
+    `Tool.execute` — se le devuelven al LLM como mensaje `role: tool` de error, y el turno
+    termina con una respuesta de texto normal en vez de propagar una excepción hasta `run()`."""
+    bad_call = ToolCall(
+        id="call_2",
+        name="get_weather",
+        arguments={},
+        arguments_error="JSON inválido en los argumentos del tool: Expecting value: line 1",
+    )
+    llm = _ScriptedLLMClient(
+        [
+            LLMResult(text="", tool_call=bad_call),
+            LLMResult(text="No pude consultar el clima ahora.", tool_call=None),
+        ]
+    )
+    policy = MagicMock(spec=PolicyEngine)
+
+    reply = pipeline.dispatch_turn(
+        "clima en Madrid",
+        llm=llm,
+        tools={"get_weather": WeatherTool()},
+        tool_schemas=[],
+        policy=policy,
+    )
+
+    assert reply == "No pude consultar el clima ahora."
+    policy.authorize_and_execute.assert_not_called()
+    tool_message = llm.calls[1][-1]
+    assert tool_message["role"] == "tool"
+    assert "JSON inválido" in tool_message["content"]
+
+
+def test_dispatch_turn_reports_unknown_tool_name_without_raising() -> None:
+    """Caso límite: si el LLM pide un tool que no está en el registro, `dispatch_turn` no
+    lanza `KeyError` — le devuelve un mensaje de error al LLM y sigue el loop."""
+    unknown_call = ToolCall(id="call_3", name="does_not_exist", arguments={})
+    llm = _ScriptedLLMClient(
+        [
+            LLMResult(text="", tool_call=unknown_call),
+            LLMResult(text="No tengo esa herramienta.", tool_call=None),
+        ]
+    )
+    policy = MagicMock(spec=PolicyEngine)
+
+    reply = pipeline.dispatch_turn(
+        "hacé algo raro", llm=llm, tools={}, tool_schemas=[], policy=policy
+    )
+
+    assert reply == "No tengo esa herramienta."
+    policy.authorize_and_execute.assert_not_called()
