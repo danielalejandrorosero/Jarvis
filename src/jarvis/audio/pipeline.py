@@ -389,9 +389,19 @@ def record_command(
     max_duration: float = COMMAND_WINDOW_SECONDS,
     pre_roll: np.ndarray | None = None,
     system_audio: SystemAudioGate | None = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, bool]:
     """Grabar el comando dicho después de la wake word, cortando solo tras un silencio
     sostenido en vez de esperar siempre `max_duration` completos.
+
+    Devuelve `(audio, speech_detected)` — `speech_detected` es `True` solo si algún chunk
+    cruzó `silence_threshold` durante la grabación. Antes esto no se exponía, y el llamador
+    mandaba el audio a transcribir sin importar si hubo habla real o no. Confirmado en vivo,
+    revisando `data/jarvis.log`: eso disparaba una cascada de transcripciones alucinadas sobre
+    silencio/ruido ambiente puro — el modelo de transcripción no confiablemente devuelve vacío
+    ante silencio, a veces inventa texto en idiomas al azar (chino, árabe, japonés, tibetano,
+    todo visto en una sola sesión). Con `speech_detected`, el llamador puede saltear la llamada
+    a `transcribe()` directamente cuando no hubo habla real, cortando la alucinación de raíz en
+    vez de intentar filtrarla después de generada.
 
     `silence_threshold` viene de `calibrate_thresholds()` — calibrado contra el ambiente real
     de esta sesión, no un número fijo. Medido en vivo: la mayoría de los comandos duran 1-2s,
@@ -449,7 +459,7 @@ def record_command(
     audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.int16)
     if pre_roll is not None and len(pre_roll) > 0:
         audio = np.concatenate([pre_roll, audio])
-    return normalize_gain(audio, min_peak=silence_threshold)
+    return normalize_gain(audio, min_peak=silence_threshold), speech_started
 
 
 def _is_affirmative(text: str) -> bool:
@@ -558,12 +568,20 @@ class VoiceConfirmationChannel:
         # tool-call (`.claude/rules/python.md`: no mezclar código bloqueante en rutas async sin
         # `asyncio.to_thread`).
         await asyncio.to_thread(self._tts.speak, prompt)
-        audio = await asyncio.to_thread(
+        audio, speech_detected = await asyncio.to_thread(
             record_command,
             device=self._device,
             silence_threshold=self._silence_threshold,
             system_audio=self._system_audio,
         )
+        if not speech_detected:
+            # Mismo fix que en run(): sin habla real detectada, no tiene sentido transcribir
+            # (y evita que una alucinación del STT sobre silencio se interprete como un "sí").
+            # Coincide además con el contrato de ADR-0004: silencio ⇒ denegar por defecto.
+            print(
+                "(confirmación) Silencio real, denegando por defecto.", file=sys.stderr
+            )
+            return False
         text = await asyncio.to_thread(transcribe, audio, client=self._stt_client)
         print(f"(confirmación) Dijiste: {text!r}", file=sys.stderr)
         return _is_affirmative(text)
@@ -835,13 +853,20 @@ def run(
                 pre_roll = (
                     np.concatenate(list(pre_roll_buffer)) if pre_roll_buffer else None
                 )
-                command_audio = record_command(
+                command_audio, speech_detected = record_command(
                     device=device,
                     silence_threshold=silence_threshold,
                     pre_roll=pre_roll,
                     system_audio=system_audio,
                 )
-                text = transcribe(command_audio, client=stt_client)
+                if not speech_detected:
+                    # Nunca cruzó el umbral de silencio — no hay audio real que transcribir.
+                    # No llamar a transcribe() acá es la mitigación real contra la cascada de
+                    # alucinaciones vista en vivo (texto random en otros idiomas sobre silencio
+                    # puro), no solo un ahorro de una llamada de red.
+                    text = ""
+                else:
+                    text = transcribe(command_audio, client=stt_client)
                 print(f"Dijiste: {text!r}")
                 if text.strip():
                     # Log automático, sin juicio del LLM (a diferencia de `remember_fact`): toda
