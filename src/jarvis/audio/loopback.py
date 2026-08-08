@@ -29,6 +29,7 @@ from __future__ import annotations
 import ctypes
 import sys
 import threading
+import warnings
 from typing import Protocol
 
 import numpy as np
@@ -234,6 +235,24 @@ class SystemAudioMonitor:
             return
         chunk_samples = max(1, int(self._chunk_seconds * device_sr))
         try:
+            # `soundcard` emite `SoundcardRuntimeWarning` cuando WASAPI reporta un frame de audio
+            # perdido en el buffer interno (visto en vivo: "data discontinuity in recording",
+            # confirmado como comportamiento esperado/no-fatal de la librería bajo carga, no un
+            # bug de este código — ver issues de `bastibe/SoundCard` sobre buffer underruns).
+            # `warnings.filterwarnings` muta el filtro global de `warnings` del proceso entero
+            # (no hay forma de scoparlo solo a este thread/loop sin `catch_warnings()`, que la
+            # propia documentación de `warnings` marca como no thread-safe si se mantiene abierto
+            # mientras corren otros threads — este monitor vive mientras JARVIS corre, así que
+            # mantenerlo abierto todo ese tiempo sería igual de global en la práctica). Se acepta
+            # el filtro global acá porque `SoundcardRuntimeWarning` es una clase específica de
+            # una sola librería para un solo escenario (frame perdido en loopback) — no hay
+            # ningún otro código en este proceso al que le importe verla, y `is_loud()` es un
+            # gate de nivel aproximado (no captura de alta fidelidad), así que perder un frame
+            # ocasional no afecta su corrección. Sin silenciar, el warning spamea
+            # `jarvis-error.log` en cada ocurrencia, degradando la señal real de ese log.
+            warnings.filterwarnings(
+                "ignore", category=sc.mediafoundation.SoundcardRuntimeWarning
+            )
             with loopback_mic.recorder(
                 samplerate=device_sr, blocksize=chunk_samples
             ) as recorder:
