@@ -29,7 +29,16 @@ DEFAULT_OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
 # femenina y menos marcada al inglés que nova.
 DEFAULT_OPENAI_TTS_VOICE = "shimmer"
 # OpenAI adapta el idioma automáticamente al texto de entrada (no hace falta un voice_id
-# específico de español, a diferencia de edge-tts).
+# específico de español, a diferencia de edge-tts) — pero por default el acento sigue sonando
+# marcado al inglés/estadounidense (confirmado en vivo, "shimmer" solo no alcanzó). El modelo
+# `gpt-4o-mini-tts` es "steerable": acepta `instructions` para dirigir cómo hablar (acento, tono),
+# no solo qué decir. Con esta instrucción explícita de acento colombiano/latinoamericano, sin
+# inglés, el usuario confirmó en vivo que suena mucho mejor.
+DEFAULT_OPENAI_TTS_INSTRUCTIONS = (
+    "Hablá en español latinoamericano neutro, con acento colombiano natural. Nunca uses acento "
+    "ni entonación en inglés/estadounidense. Voz cálida, femenina, natural, como una persona "
+    "real hablando español de nacimiento."
+)
 
 
 class TTSClient(Protocol):
@@ -47,16 +56,21 @@ class OpenAITTSClient:
         client: OpenAI | None = None,
         model: str = DEFAULT_OPENAI_TTS_MODEL,
         voice: str = DEFAULT_OPENAI_TTS_VOICE,
+        instructions: str = DEFAULT_OPENAI_TTS_INSTRUCTIONS,
     ) -> None:
         self._client = client if client is not None else OpenAI()
         self._model = model
         self._voice = voice
+        self._instructions = instructions
 
     def speak(self, text: str) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out_path = Path(tmp) / "speech.mp3"
             with self._client.audio.speech.with_streaming_response.create(
-                model=self._model, voice=self._voice, input=text
+                model=self._model,
+                voice=self._voice,
+                input=text,
+                instructions=self._instructions,
             ) as response:
                 response.stream_to_file(str(out_path))
             playsound(str(out_path))
