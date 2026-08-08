@@ -225,6 +225,39 @@ def test_disables_gracefully_when_input_stream_fails_to_open(
     assert monitor.is_loud() is False
 
 
+def test_disables_gracefully_when_wasapi_settings_rejects_loopback_kwarg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regresión de un bug real (no cubierto por `_patch_device_resolution`, que stubea
+    `sd.WasapiSettings` como un `lambda **kwargs: kwargs` que acepta cualquier cosa): la build de
+    `sounddevice` instalada puede no exponer el kwarg `loopback` en
+    `WasapiSettings.__init__` — confirmado en vivo (`sounddevice==0.5.5`, ver
+    `data/jarvis-error.log`: "TypeError: WasapiSettings.__init__() got an unexpected keyword
+    argument 'loopback'", sin atrapar, tumbando el thread de fondo entero). Antes de este fix,
+    ese `TypeError` no lo atrapaba nada en `_run()` (solo se atrapaba `sd.PortAudioError`) — acá
+    se simula esa construcción real fallando, y el monitor debe degradarse igual que ante un
+    `PortAudioError` al abrir el stream, no crashear el thread."""
+    monkeypatch.setattr(loopback, "resolve_output_device", lambda device: 3)
+    monkeypatch.setattr(loopback, "output_sample_rate", lambda device: 48_000)
+    monkeypatch.setattr(
+        loopback.sd, "query_devices", lambda device: {"max_output_channels": 2}
+    )
+
+    def _raise_type_error(**_kwargs: object) -> Any:
+        raise TypeError(
+            "WasapiSettings.__init__() got an unexpected keyword argument 'loopback'"
+        )
+
+    monkeypatch.setattr(loopback.sd, "WasapiSettings", _raise_type_error)
+    monitor = SystemAudioMonitor(chunk_seconds=0.01)
+
+    monitor.start()
+    assert _poll_until(lambda: monitor._disabled)
+    monitor.stop()
+
+    assert monitor.is_loud() is False
+
+
 # --- thread-safety -----------------------------------------------------------------------------
 
 

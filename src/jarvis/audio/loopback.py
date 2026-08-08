@@ -138,7 +138,20 @@ class SystemAudioMonitor:
                     level = _chunk_rms(chunk.reshape(-1))
                     with self._lock:
                         self._level = level
-        except sd.PortAudioError as exc:
+        except (sd.PortAudioError, TypeError) as exc:
+            # `TypeError` además de `PortAudioError`: bug real encontrado revisando
+            # `data/jarvis-error.log` (traceback "Exception in thread ... Thread-1 (_run)" sin
+            # capturar, en cada corrida). La build de `sounddevice` instalada puede no exponer el
+            # kwarg `loopback` en `WasapiSettings.__init__` (confirmado en vivo:
+            # `sounddevice==0.5.5` no lo acepta) — eso lanza `TypeError` al construir
+            # `WasapiSettings`, ANTES de llegar siquiera a abrir el `InputStream`, y antes de este
+            # fix no lo atrapaba nada acá, así que tumbaba este thread de fondo entero con un
+            # traceback crudo en vez de degradar según el contrato ya documentado de esta clase
+            # ("si el stream de loopback no pudo abrirse... `_disabled=True`... JARVIS sigue
+            # funcionando sin él"). No es una mitigación completa (el gate de audio fuerte del
+            # sistema queda inactivo mientras la build instalada no soporte loopback — ver
+            # hallazgo abierto para seguimiento), pero al menos falla de forma segura y visible en
+            # vez de crashear un thread en silencio.
             self._disable(exc)
 
     def _disable(self, exc: Exception) -> None:

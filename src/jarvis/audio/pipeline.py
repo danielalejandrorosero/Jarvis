@@ -657,10 +657,23 @@ def dispatch_turn(
     allá de lo razonable, en vez de loopear indefinidamente.
 
     Si se pasa `tts`, JARVIS dice una frase corta de acuse ("dejame revisar eso") apenas se
-    detecta un tool-call, antes de ejecutarlo — un tool real (clima, búsqueda web) tarda unos
-    segundos en volver, y sin esto quedaba en silencio todo ese tiempo, lo que se sentía como
-    que se había colgado. `tts=None` (el default) preserva el comportamiento silencioso para
-    quien llame a `dispatch_turn` sin audio (tests, u otros usos futuros no interactivos).
+    detecta el PRIMER tool-call del turno, antes de ejecutarlo — un tool real (clima, búsqueda
+    web) tarda unos segundos en volver, y sin esto quedaba en silencio todo ese tiempo, lo que se
+    sentía como que se había colgado. `tts=None` (el default) preserva el comportamiento
+    silencioso para quien llame a `dispatch_turn` sin audio (tests, u otros usos futuros no
+    interactivos).
+
+    Se dice como máximo UNA vez por turno, no una vez por tool-call encadenado (bug encontrado
+    revisando `data/jarvis.log`/quejas en vivo del usuario: "dice muchas veces lo repetido y se
+    demora en ejecutar cosas"). `SYSTEM_PROMPT` instruye explícitamente al LLM a encadenar
+    `search_web` + `open_url` para pedidos tipo "poné tal canción en YouTube" — eso son 2-3
+    iteraciones de este loop en un solo turno, y antes de este fix cada una volvía a decir la
+    frase de acuse entera (con su propio round-trip de red a `edge-tts` y reproducción, ver
+    `EdgeTTSClient.speak` en `jarvis.audio.tts` — no es gratis, es bloqueante), así que el usuario
+    escuchaba "Dale, dejame revisar eso." repetido 2-3 veces seguidas Y esa repetición sumaba
+    varios segundos reales de latencia extra encima de las llamadas al LLM/tools en sí. Una sola
+    vez alcanza para el propósito original (avisar que no se colgó); repetirla no aporta nada
+    nuevo y sí cuesta tiempo y suena mal.
 
     `memory_db_path` (default `jarvis.memory.store.DEFAULT_DB_PATH`) es la DB de la que se cargan
     los hechos recordados para este turno (`_build_system_prompt`) — parametrizable para tests
@@ -673,14 +686,16 @@ def dispatch_turn(
         },
         {"role": "user", "content": user_text},
     ]
+    acked = False
     for _ in range(MAX_TOOL_CALLS_PER_TURN):
         result = llm.complete(messages, tools=tool_schemas)
         if result.tool_call is None:
             return result.text
         tool_call = result.tool_call
         messages.append(_assistant_message_for_tool_call(result))
-        if tool_call.arguments_error is None and tts is not None:
+        if tool_call.arguments_error is None and tts is not None and not acked:
             tts.speak(TOOL_CALL_ACK_PHRASE)
+            acked = True
         if tool_call.arguments_error is not None:
             # Argumentos malformados (JSON inválido, o JSON válido pero no un objeto) — nunca
             # se llega a `PolicyEngine`/`Tool.execute` con esto; se le devuelve el error al LLM

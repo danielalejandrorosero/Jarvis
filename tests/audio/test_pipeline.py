@@ -527,6 +527,49 @@ def test_dispatch_turn_speaks_ack_phrase_before_executing_a_valid_tool_call(
     tts.speak.assert_called_once_with(pipeline.TOOL_CALL_ACK_PHRASE)
 
 
+def test_dispatch_turn_speaks_ack_phrase_only_once_across_chained_tool_calls(
+    tmp_path: Path,
+) -> None:
+    """Regresión de un bug real encontrado revisando `data/jarvis.log` y quejas en vivo del
+    usuario ("dice muchas veces lo repetido y se demora en ejecutar cosas"): `SYSTEM_PROMPT`
+    instruye al LLM a encadenar varios tool-calls en un mismo turno (ej. `search_web` seguido de
+    `open_url` para "poné tal canción en YouTube") — antes de este fix, `TOOL_CALL_ACK_PHRASE` se
+    decía una vez por CADA tool-call del turno, no una vez por turno, así que el usuario escuchaba
+    la misma frase repetida 2-3 veces seguidas (cada una con su propio costo real de síntesis de
+    voz, ver `EdgeTTSClient.speak`). Con dos tool-calls encadenados en el mismo turno, `tts.speak`
+    debe llamarse una sola vez en total, no dos."""
+    tool = _StubTool()
+    first_call = ToolCall(id="call_1", name="get_weather", arguments={"city": "Madrid"})
+    second_call = ToolCall(id="call_2", name="get_weather", arguments={"city": "Roma"})
+    llm = _ScriptedLLMClient(
+        [
+            LLMResult(text="", tool_call=first_call),
+            LLMResult(text="", tool_call=second_call),
+            LLMResult(text="Listo.", tool_call=None),
+        ]
+    )
+
+    class _AlwaysDenyChannel:
+        async def ask(self, prompt: str) -> bool:
+            return False
+
+    policy = PolicyEngine(_AlwaysDenyChannel())
+    tts = MagicMock(spec=TTSClient)
+
+    reply = pipeline.dispatch_turn(
+        "poné una canción en YouTube",
+        llm=llm,
+        tools={tool.name: tool},
+        tool_schemas=[],
+        policy=policy,
+        tts=tts,
+        memory_db_path=tmp_path / "jarvis.db",
+    )
+
+    assert reply == "Listo."
+    tts.speak.assert_called_once_with(pipeline.TOOL_CALL_ACK_PHRASE)
+
+
 def test_dispatch_turn_without_tts_never_speaks_anything(tmp_path: Path) -> None:
     """`tts=None` (el default) preserva el comportamiento silencioso — no debe fallar ni intentar
     hablar nada."""
