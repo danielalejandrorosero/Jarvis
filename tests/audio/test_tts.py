@@ -1,0 +1,105 @@
+"""Tests para `FallbackTTSClient.speak()` (la capa de recuperación de ADR-0004).
+
+`EdgeTTSClient` y `SapiTTSClient` pegan contra red/hardware de audio real y no son testeables
+como unit test (requieren un endpoint no oficial de Microsoft y/o SAPI real). Lo que sí es
+testeable, y el punto central de este módulo, es `FallbackTTSClient`: primario y fallback se
+reemplazan por stubs controlados por el test, así que corre rápido, sin red y sin reproducir
+audio (CI-safe). `load_default_tts_client()` no se invoca: construiría clientes reales.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+from jarvis.audio.tts import FallbackTTSClient, TTSClient, load_default_tts_client
+
+
+class _FakeTTSClient:
+    """Stub de `TTSClient`: registra los textos con los que se llamó `.speak()` (spy)."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def speak(self, text: str) -> None:
+        self.calls.append(text)
+
+
+class _RaisingTTSClient:
+    """Stub de `TTSClient` cuyo `.speak()` siempre lanza la excepción dada."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def speak(self, text: str) -> None:
+        raise self._exc
+
+
+def test_speak_calls_only_primary_when_primary_succeeds() -> None:
+    """Caso aceptado: si el primario no falla, se lo llama con el texto correcto y el
+    fallback no se toca en absoluto."""
+    primary = _FakeTTSClient()
+    fallback = _FakeTTSClient()
+    client = FallbackTTSClient(primary=primary, fallback=fallback)
+
+    client.speak("hola jarvis")
+
+    assert primary.calls == ["hola jarvis"]
+    assert fallback.calls == []
+
+
+def test_speak_falls_back_when_primary_raises_runtime_error() -> None:
+    """Caso rechazado: si el primario lanza (RuntimeError, no algo genérico ya esperado),
+    el fallback se llama con el mismo texto."""
+    primary = _RaisingTTSClient(RuntimeError("edge-tts endpoint no disponible"))
+    fallback = _FakeTTSClient()
+    client = FallbackTTSClient(primary=primary, fallback=fallback)
+
+    client.speak("hola jarvis")
+
+    assert fallback.calls == ["hola jarvis"]
+
+
+def test_speak_falls_back_on_arbitrary_exception_type() -> None:
+    """La captura es deliberadamente amplia (`except Exception`, documentado en el propio
+    módulo como la capa de recuperación de ADR-0004): un tipo de excepción no relacionado con
+    red/audio (ValueError) también dispara el fallback, no solo errores "esperables"."""
+    primary = _RaisingTTSClient(ValueError("algo totalmente distinto"))
+    fallback = _FakeTTSClient()
+    client = FallbackTTSClient(primary=primary, fallback=fallback)
+
+    client.speak("hola jarvis")
+
+    assert fallback.calls == ["hola jarvis"]
+
+
+def test_speak_does_not_propagate_primary_exception() -> None:
+    """Caso límite: aunque el primario lance, `FallbackTTSClient.speak()` no debe lanzar —
+    ese es el contrato central de "JARVIS nunca queda mudo"."""
+    primary = _RaisingTTSClient(RuntimeError("boom"))
+    fallback = _FakeTTSClient()
+    client = FallbackTTSClient(primary=primary, fallback=fallback)
+
+    # Si esto lanzara, el test fallaría con la excepción sin necesidad de pytest.raises.
+    client.speak("no debería propagar")
+
+
+def test_speak_does_not_call_fallback_when_fallback_would_also_fail_but_primary_succeeds() -> None:
+    """Confirma que el éxito del primario evita tocar el fallback incluso si el fallback está
+    configurado para fallar: la lógica no llama al fallback "por las dudas"."""
+    primary = _FakeTTSClient()
+    fallback = MagicMock(spec=TTSClient)
+    fallback.speak.side_effect = RuntimeError("no debería ejecutarse nunca")
+    client = FallbackTTSClient(primary=primary, fallback=fallback)
+
+    client.speak("texto")
+
+    fallback.speak.assert_not_called()
+
+
+def test_load_default_tts_client_returns_a_fallback_tts_client() -> None:
+    """`load_default_tts_client()` arma un `FallbackTTSClient` real (edge-tts + SAPI), pero el
+    test no invoca `.speak()` sobre él: construir las instancias es barato (sin I/O), llamarlas
+    no lo es."""
+    client = load_default_tts_client()
+
+    assert isinstance(client, FallbackTTSClient)

@@ -8,6 +8,10 @@ dependencies = [
     "sounddevice>=0.4",
     "numpy>=1.26",
     "faster-whisper>=1.2",
+    "openai>=1.0",
+    "edge-tts>=7.0",
+    "pyttsx3>=2.90",
+    "playsound3>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -34,7 +38,7 @@ python_version = "3.12"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["sounddevice", "openwakeword.*", "faster_whisper.*"]
+module = ["sounddevice", "openwakeword.*", "faster_whisper.*", "edge_tts.*", "pyttsx3.*", "playsound3.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

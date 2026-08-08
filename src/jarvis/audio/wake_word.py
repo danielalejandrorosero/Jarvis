@@ -20,16 +20,16 @@ SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1280  # 80ms a 16kHz: tamaño de chunk recomendado por openWakeWord
 WAKEWORD_NAME = "hey_jarvis"
 
-# Calibrado empíricamente (fase 1, docs/decisions/, sesión de diagnóstico en vivo), no elegido
-# al azar. Con el modelo pretrained "hey_jarvis" y la voz/pronunciación del usuario de este
-# proyecto, el score máximo observado en ~8 tomas reales (dos micrófonos, distintos volúmenes)
-# fue 0.4916, con la mayoría de las tomas entre 0.05 y 0.2. El default de openWakeWord (0.5)
-# nunca cruzó en la práctica. 0.3 es un punto medio: por debajo del mejor caso real, por encima
-# del piso de ruido — prioriza no quedar mudo por sobre el riesgo de falsos positivos, aceptable
-# en esta fase porque ninguna acción real está atada todavía a la detección (ADR-0004). Si en la
-# próxima fase se ata una acción real a esto, revisar este valor junto con el contrato de
-# confirmación verbal (silencio/ambigüedad = denegar).
-DEFAULT_THRESHOLD = 0.3
+# Calibrado empíricamente (fase 1 y recalibrado en fase 4, docs/decisions/), no elegido al azar.
+# Con el modelo pretrained "hey_jarvis", el score varía sesión a sesión: fase 1 llegó a 0.4916
+# de máximo; una sesión posterior (fase 4) topeó en 0.2997, con la mayoría de las tomas entre
+# 0.05 y 0.2 en ambas. El default de openWakeWord (0.5) nunca cruzó en la práctica, y 0.3
+# tampoco fue confiable en la segunda sesión. 0.25 prioriza no quedar mudo por sobre el riesgo
+# de falsos positivos — aceptable mientras ninguna acción real esté atada a la detección
+# (ADR-0004). Si en una fase futura se ata una acción real a esto, revisar este valor junto con
+# el contrato de confirmación verbal (silencio/ambigüedad = denegar), y considerar entrenar un
+# modelo de wake word con la voz real del usuario en vez de seguir bajando el umbral genérico.
+DEFAULT_THRESHOLD = 0.25
 
 
 @dataclass(frozen=True)
