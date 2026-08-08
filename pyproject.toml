@@ -1,0 +1,36 @@
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "Asistente personal de voz para Windows"
+requires-python = ">=3.12"
+dependencies = [
+    "openwakeword>=0.6",
+    "sounddevice>=0.4",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pytest>=8.3",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["sounddevice", "openwakeword.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
