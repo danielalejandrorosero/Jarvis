@@ -138,7 +138,11 @@ from jarvis.tools.base import Tool
 from jarvis.tools.close_app import CloseAppTool
 from jarvis.tools.lol_champion_select import LockChampionTool, PreviewChampionTool
 from jarvis.tools.lol_runes import SetRunesTool
-from jarvis.tools.lol_start_queue import CancelQueueTool, StartQueueTool
+from jarvis.tools.lol_start_queue import (
+    CancelQueueTool,
+    SetLobbyQueueTool,
+    StartQueueTool,
+)
 from jarvis.tools.lol_summoner_spells import SetSummonerSpellsTool
 from jarvis.tools.media_control import MediaControlTool
 from jarvis.tools.open_app import OpenAppTool
@@ -293,9 +297,17 @@ SYSTEM_PROMPT = (
     "comportamiento que close_app: si dice que sí se lockea, si dice que no no pasa nada). "
     "Ninguna de las dos funciona en modos sin elección propia como ARAM (ahí el campeón se "
     "asigna al azar), pero sí en Ranked, Normales y Arena; start_lol_queue arranca la búsqueda "
-    "de partida cuando el "
-    "usuario ya está sentado en un lobby armado (no arma el lobby ni elige la cola por vos) y "
-    "cancel_lol_queue cancela una búsqueda de partida en curso. "
+    "de partida cuando el usuario ya está sentado en un lobby armado, sin crear ni cambiar la "
+    "cola — no acepta ningún parámetro de cola. Para armar o cambiar de cola (ej. 'cambiate a "
+    "Solo/Dúo y buscá', 'armá una de Arena') usá set_lol_lobby_queue en vez de start_lol_queue, "
+    "con queue_type ('ranked_solo_duo', 'normal_draft', 'normal_blind', 'aram' o 'arena') — no "
+    "hace falta que ya esté en un lobby de esa cola, arma o reemplaza el que haya y arranca la "
+    "búsqueda en el mismo paso, pero como reemplazar el lobby actual puede afectar a compañeros "
+    "ya invitados a él, le pide confirmación hablada al usuario antes de ejecutarse (mismo "
+    "comportamiento que close_app/lock_lol_champion: si dice que sí se arma y busca, si dice que "
+    "no no pasa nada); si ya está buscando partida, va a pedirte que canceles primero con "
+    "cancel_lol_queue en vez de cambiar de cola a mitad de búsqueda. cancel_lol_queue cancela una "
+    "búsqueda de partida en curso. "
     "Para cualquier otra "
     "acción sobre la computadora todavía no tenés herramientas disponibles. "
     "La transcripción de voz a veces sale con alguna palabra rara o sin sentido pegada al "
@@ -1064,6 +1076,7 @@ def run(
             PreviewChampionTool(),
             LockChampionTool(),
             StartQueueTool(),
+            SetLobbyQueueTool(),
             CancelQueueTool(),
         )
     }
