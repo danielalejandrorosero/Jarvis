@@ -27,6 +27,19 @@ logger = logging.getLogger(__name__)
 
 DEEPSEEK_BASE_URL_DEFAULT = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-chat"
+# Sin fijar antes: `chat.completions.create()` usaba el default de la API (1.0, confirmado
+# contra la documentación oficial de DeepSeek — api-docs.deepseek.com/quick_start/
+# parameter_settings), pensado para conversación general/creativa. Acá el mismo modelo hace dos
+# cosas a la vez en cada llamada: decidir qué tool invocar con qué argumentos (selección
+# estructurada — la práctica general para function-calling/reconocimiento de intención es 0.0,
+# máximo determinismo) y responder en lenguaje natural (se beneficia de algo de variación). Sin
+# forma de separar ambos casos en una sola llamada, 0.25 es el valor que múltiples fuentes sobre
+# voice agents (ej. la guía de temperatura de Vapi AI, especializados en agentes de voz)
+# reportan como el punto de equilibrio exacto para este mismo escenario híbrido — no un valor
+# medido en vivo contra esta cuenta/modelo puntual (a diferencia de `DEFAULT_LOUDNESS_THRESHOLD`
+# en `jarvis.audio.loopback`), pero sí respaldado por literatura específica del caso de uso, en
+# vez de una estimación propia sin más.
+TEMPERATURE = 0.25
 
 
 @dataclass(frozen=True)
@@ -174,7 +187,11 @@ class DeepSeekClient:
         *,
         tools: list[ToolSchema] | None = None,
     ) -> LLMResult:
-        create_kwargs: dict[str, Any] = {"model": self._model, "messages": messages}
+        create_kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": TEMPERATURE,
+        }
         if tools:
             create_kwargs["tools"] = [_to_openai_tool_param(schema) for schema in tools]
         response = self._client.chat.completions.create(**create_kwargs)

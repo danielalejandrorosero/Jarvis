@@ -368,10 +368,55 @@ def test_measure_noise_floor_passes_resolved_device_and_sample_rate_to_sd_rec(
         ("pará, todavía no", False),
         ("bueno dale", False),  # "bueno" no reconocido: ambigüedad -> denegar
         ("quiero un café", False),
+        # Frases naturales reales reportadas por el usuario en vivo (bug real): antes fallaban
+        # porque la frase completa no consistía SOLO en palabras de _AFFIRMATIVE_WORDS.
+        ("dale, dale ya", True),
+        ("sí, va, confirmado", True),
+        ("dale porfa", True),
+        ("sí, por favor", True),
+        ("sí, claro", True),
+        # "no me fustigues" sigue denegando a propósito: contiene "no" (capa 1, veto por
+        # negación) — ambigüedad genuina para un clasificador simple, y ADR-0004 exige denegar
+        # ante cualquier ambigüedad, no aprobar por contexto coloquial.
+        ("armala ya, no me fustigues", False),
     ],
 )
 def test_is_affirmative(text: str, expected: bool) -> None:
     assert pipeline._is_affirmative(text) is expected
+
+
+# --- _contains_non_latin_script (filtro de alucinación de STT, bug real en vivo) ---------------
+# `jarvis.audio.stt.LANGUAGE = "es"` fija el idioma esperado: una transcripción legítima nunca
+# usa árabe/cirílico/CJK/etc. — si aparece, es alucinación de `gpt-4o-transcribe` sobre audio
+# ruidoso (voces de fondo, juego) que sí cruzó el umbral de silencio pero no era el usuario
+# hablando, nunca habla real en otro alfabeto.
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("", False),
+        ("abrí YouTube", False),
+        (
+            "¿Qué hora es?",
+            False,
+        ),  # acentos/signos españoles normales, no deben disparar
+        (
+            "Der Kontrollenduetum",
+            False,
+        ),  # gibberish pero alfabeto latino, no se filtra acá
+        ("أفهمت؟", True),  # árabe, el caso real visto en vivo
+        ("Привет", True),  # cirílico
+        ("こんにちは", True),  # japonés
+        ("normal pero con一个carácter chino", True),  # mezclado, alcanza con uno solo
+        (
+            "。",
+            True,
+        ),  # bug real encontrado revisando data/jarvis.db: puntuación CJK sola
+    ],
+)
+def test_contains_non_latin_script(text: str, expected: bool) -> None:
+    assert pipeline._contains_non_latin_script(text) is expected
 
 
 # --- _contains_any_word (modo dormir/despertar) -----------------------------------------------
@@ -387,9 +432,14 @@ def test_is_affirmative(text: str, expected: bool) -> None:
         ("Jarvis, andate a descansar", True),
         ("descansá un rato", True),
         ("vete de acá", True),
+        ("Alexa, desconéctate", True),  # bug real en vivo: no matcheaba antes
+        ("Alexa, apágate", True),
+        ("cállate", True),
         ("", False),
         ("quiero un café", False),
         ("qué hora es", False),
+        ("chau, nos vemos", False),  # despedida a otra persona, no debe dormir a JARVIS
+        ("bueno, adiós", False),
     ],
 )
 def test_contains_any_word_detects_sleep_phrases(text: str, expected: bool) -> None:

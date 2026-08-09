@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from jarvis.llm.client import (
+    TEMPERATURE,
     DeepSeekClient,
     LLMResult,
     ToolCall,
@@ -92,6 +93,18 @@ def test_complete_sends_messages_through_unchanged() -> None:
 
     _args, kwargs = fake_openai_client.chat.completions.create.call_args
     assert kwargs["messages"] == messages
+
+
+def test_complete_sends_deterministic_temperature() -> None:
+    """`temperature` (`jarvis.llm.client.TEMPERATURE`) se manda siempre — el default de la API
+    (1.0) es demasiado alto para selección de tool confiable, ver comentario junto a la
+    constante."""
+    client, fake_openai_client = _client_with(_fake_response("ok"))
+
+    client.complete([{"role": "user", "content": "hola"}])
+
+    _args, kwargs = fake_openai_client.chat.completions.create.call_args
+    assert kwargs["temperature"] == TEMPERATURE
     assert "tools" not in kwargs
 
 

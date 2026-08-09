@@ -20,12 +20,21 @@ from jarvis.audio.stt import transcribe
 SAMPLE_RATE = 16_000
 
 
-class _FakeTranscription:
-    """Stub de la respuesta de `client.audio.transcriptions.create()`: solo expone `.text`, lo
-    único que usa `transcribe()`."""
+class _FakeLogprob:
+    def __init__(self, logprob: float) -> None:
+        self.logprob = logprob
 
-    def __init__(self, text: str) -> None:
+
+class _FakeTranscription:
+    """Stub de la respuesta de `client.audio.transcriptions.create()`: expone `.text` y
+    `.logprobs` (default `None`, igual que la API real cuando no se pide `include=["logprobs"]`
+    o el modelo no los devuelve), lo único que usa `transcribe()`."""
+
+    def __init__(
+        self, text: str, *, logprobs: list[_FakeLogprob] | None = None
+    ) -> None:
         self.text = text
+        self.logprobs = logprobs
 
 
 class _FakeTranscriptions:
@@ -57,11 +66,13 @@ class _FakeOpenAIClient:
         self.audio = _FakeAudio(_FakeTranscriptions(response))
 
 
-def _client_with(text: str) -> tuple[OpenAI, _FakeTranscriptions]:
+def _client_with(
+    text: str, *, logprobs: list[_FakeLogprob] | None = None
+) -> tuple[OpenAI, _FakeTranscriptions]:
     # El stub no implementa la superficie completa de OpenAI, solo lo que `transcribe()` usa
     # (`.audio.transcriptions.create()`). Se castea para satisfacer la firma de
     # `transcribe(..., client: OpenAI)`.
-    fake_client = _FakeOpenAIClient(_FakeTranscription(text))
+    fake_client = _FakeOpenAIClient(_FakeTranscription(text, logprobs=logprobs))
     return cast(OpenAI, fake_client), fake_client.audio.transcriptions
 
 
@@ -128,6 +139,43 @@ def test_transcribe_sends_model_kwarg() -> None:
     transcribe(audio, client=client, sample_rate=SAMPLE_RATE)
 
     assert spy.calls[0]["model"] == stt.MODEL
+
+
+def test_transcribe_sends_deterministic_decoding_and_logprobs_kwargs() -> None:
+    """`temperature=0.0` (decoding determinístico, menos alucinación), `response_format="json"`
+    y `include=["logprobs"]` (requisito de la API para que devuelva logprobs con este modelo) se
+    mandan siempre — ver docstring del módulo para el motivo."""
+    client, spy = _client_with("ok")
+    audio = np.zeros(4, dtype=np.int16)
+
+    transcribe(audio, client=client, sample_rate=SAMPLE_RATE)
+
+    assert spy.calls[0]["temperature"] == stt.TEMPERATURE
+    assert spy.calls[0]["response_format"] == "json"
+    assert spy.calls[0]["include"] == ["logprobs"]
+
+
+def test_transcribe_logs_average_logprob_when_present(caplog: Any) -> None:
+    """Cuando la respuesta trae `logprobs`, se loguea el promedio a INFO — evidencia real para
+    poder calibrar un filtro de confianza más adelante (ver docstring de `transcribe`)."""
+    client, _spy = _client_with("ok", logprobs=[_FakeLogprob(-0.1), _FakeLogprob(-0.3)])
+    audio = np.zeros(4, dtype=np.int16)
+
+    with caplog.at_level("INFO", logger="jarvis.audio.stt"):
+        transcribe(audio, client=client, sample_rate=SAMPLE_RATE)
+
+    assert any("confianza promedio" in record.message for record in caplog.records)
+
+
+def test_transcribe_does_not_crash_when_logprobs_is_none() -> None:
+    """`logprobs=None` (default del stub, igual que la respuesta real cuando el modelo no los
+    devuelve) no debe romper `transcribe()` — nunca hay `logprobs` que loguear en ese caso."""
+    client, _spy = _client_with("ok", logprobs=None)
+    audio = np.zeros(4, dtype=np.int16)
+
+    result = transcribe(audio, client=client, sample_rate=SAMPLE_RATE)
+
+    assert result == "ok"
 
 
 def test_transcribe_packages_audio_as_valid_wav_with_correct_format() -> None:

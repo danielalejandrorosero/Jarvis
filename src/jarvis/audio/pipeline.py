@@ -112,6 +112,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 import time
@@ -318,7 +319,14 @@ SYSTEM_PROMPT = (
     "está preguntando...', 'esto parece referirse a...'), ni notas dirigidas a vos mismo sobre "
     "qué deberías responder ('debo pedir aclaración...', 'voy a...'): pensá eso puertas adentro, "
     "sin escribirlo, porque todo lo que aparece en tu respuesta se lee en voz alta tal cual, sin "
-    "distinguir razonamiento de respuesta real. Podés consultar el clima "
+    "distinguir razonamiento de respuesta real. Si el usuario pide varias acciones distintas en "
+    "un mismo pedido (ej. 'abrí Discord y poné tal canción', 'previsualizá tal campeón y "
+    "configurame las runas'), NO le pidas que elija una sola ni le preguntes cuál hacer primero: "
+    "ejecutá una herramienta, mirá su resultado, y si todavía falta la siguiente acción pedida "
+    "pedí otra herramienta en el mismo turno — podés encadenar hasta varias llamadas seguidas "
+    "así, no estás limitado a una sola por turno. Preguntar cuál elegir solo tiene sentido "
+    "cuando dos acciones pedidas son mutuamente excluyentes de verdad (ej. dos campeones "
+    "distintos para el mismo pick), nunca cuando son independientes entre sí. Podés consultar el clima "
     "de una ciudad, buscar información en la web, abrir "
     "aplicaciones instaladas en la computadora, abrir sitios web, cerrar aplicaciones que estén "
     "corriendo, y recordar datos del usuario para futuras conversaciones. Podés controlar la "
@@ -348,7 +356,17 @@ SYSTEM_PROMPT = (
     "puede deshacer, le pide confirmación hablada al usuario antes de ejecutarse (mismo "
     "comportamiento que close_app: si dice que sí se lockea, si dice que no no pasa nada). "
     "Ninguna de las dos funciona en modos sin elección propia como ARAM (ahí el campeón se "
-    "asigna al azar), pero sí en Ranked, Normales y Arena; start_lol_queue arranca la búsqueda "
+    "asigna al azar), pero sí en Ranked, Normales y Arena. Importante: no existe ninguna "
+    "herramienta para BANEAR un campeón (la fase de bans antes de la selección) — solo para "
+    "elegir/confirmar tu propio pick. En jerga de League of Legends, 'bloquear'/'banear' un "
+    "campeón normalmente significa vetarlo para que nadie lo pueda jugar en esa partida, algo "
+    "totalmente distinto de lock_lol_champion (que 'bloquea'/confirma TU PROPIA elección, no "
+    "vetás al rival). Si el pedido es ambiguo entre esas dos lecturas (ej. 'bloqueá a tal "
+    "campeón' sin más contexto), o pide explícitamente banear/vetar a alguien, aclará que no "
+    "podés banear campeones todavía y preguntá si en realidad se refiere a elegir/confirmar su "
+    "propio pick — nunca asumas que 'bloquear a X' significa elegir a X como si fuera tu propio "
+    "campeón. "
+    "start_lol_queue arranca la búsqueda "
     "de partida cuando el usuario ya está sentado en un lobby armado, sin crear ni cambiar la "
     "cola — no acepta ningún parámetro de cola. Para armar o cambiar de cola (ej. 'cambiate a "
     "Solo/Dúo y buscá', 'armá una de Arena') usá set_lol_lobby_queue en vez de start_lol_queue, "
@@ -374,7 +392,16 @@ SYSTEM_PROMPT = (
     "interpretación razonable de una transcripción parcialmente rota — igual que un humano "
     "completa una frase que se cortó por mala señal. Solo pedí que repita cuando de verdad no "
     "haya ninguna interpretación plausible con el contexto que tenés, no ante cualquier palabra "
-    "sin sentido. "
+    "sin sentido. La transcripción también deforma nombres propios y de marcas foneticamente "
+    "(ej. 'yutu'/'yutub' es YouTube, 'gogle'/'guguel' es Google) — interpretalos por cómo suenan, "
+    "igual que un hablante nativo entendería un nombre mal pronunciado, en vez de tratarlos como "
+    "palabras sin sentido. Si la transcripción se refiere en tercera persona a un nombre propio "
+    "corto que coincide con el del usuario (Daniel/Dani/Dany), asumí que habla de sí mismo, no de "
+    "otra persona. Cuando el pedido nombra solo un juego o modo de juego sin un verbo claro (ej. "
+    "'de arena en League of Legends', 'lo de ARAM'), la interpretación casi siempre es 'buscar "
+    "esa partida' — es la acción más común con diferencia; priorizá esa lectura (start_lol_queue "
+    "o set_lol_lobby_queue según si ya estás en la cola correcta) en vez de listar alternativas "
+    "menos comunes (ver runas, cambiar de campeón) y preguntar cuál querés decir. "
     "Cerrar una aplicación (close_app) le pide confirmación hablada al usuario antes de "
     "ejecutarse — eso es esperado, no un error: si el usuario dice que sí, se cierra; si dice "
     "que no, no pasa nada y se lo podés informar con naturalidad. "
@@ -475,6 +502,7 @@ _AFFIRMATIVE_WORDS = frozenset(
         "sí",
         "dale",
         "confirmo",
+        "confirmado",
         "afirmativo",
         "ok",
         "okay",
@@ -482,6 +510,18 @@ _AFFIRMATIVE_WORDS = frozenset(
         "adelante",
         "hazlo",
         "hacelo",
+        # Palabras agregadas para frases naturales completas tipo "dale, dale ya" o "sí, va,
+        # confirmado" — capa 2 sigue exigiendo que TODA la frase esté compuesta solo por estas
+        # palabras (nada cambia en la capa 1, el veto por negación, que sigue siendo la garantía
+        # real de seguridad de ADR-0004). Ninguna de estas es ambigua por sí sola hacia una
+        # negación — a diferencia de "bueno" (dejada afuera a propósito, ver test existente:
+        # puede ser una duda/hesitación, no una afirmación clara).
+        "ya",
+        "va",
+        "claro",
+        "porfa",
+        "favor",
+        "por",
     }
 )
 # Cualquiera de estas palabras en la respuesta deniega, sin importar qué otra palabra afirmativa
@@ -733,6 +773,26 @@ _SLEEP_WORDS = frozenset(
         "dormir",
         "duerme",
         "silencio",
+        # Bug real, en vivo: "Alexa, desconéctate" no matcheaba ninguna de las anteriores, caía
+        # a `dispatch_turn` sin ninguna tool de "apagar/desconectar" — el LLM se inventaba un
+        # ritual de confirmación ("decime adiós") que además no llevaba a ningún lado ni siquiera
+        # diciendo "adiós", porque esa palabra tampoco estaba reconocida acá. Se agregan como
+        # sinónimos del mismo modo dormir ya existente (sin confirmación, mismo criterio que
+        # "descansá"): pedir que JARVIS deje de escuchar es exactamente lo mismo pedido con otras
+        # palabras, no una acción distinta que necesite pasar por el LLM ni por PolicyEngine.
+        "desconecta",
+        "desconéctate",
+        "desconectate",
+        "apaga",
+        "apágate",
+        "apagate",
+        "callate",
+        "cállate",
+        # "adiós"/"chau" quedan afuera a propósito: son despedidas comunes en conversación
+        # normal (ej. despidiéndose de otra persona, no de JARVIS) — `_contains_any_word` matchea
+        # con que la palabra aparezca en cualquier parte de la frase, así que agregarlas
+        # dispararía el modo dormir en falsos positivos mucho más seguido que los imperativos de
+        # arriba, que son inequívocamente un comando dirigido a JARVIS.
     }
 )
 _WAKE_WORDS = frozenset(
@@ -870,6 +930,50 @@ def _escape_untrusted(text: str) -> str:
     `security-reviewer`, ver docstring del módulo).
     """
     return text.replace("<", "&lt;").replace(">", "&gt;")
+
+
+# Rangos Unicode de scripts no latinos que no pueden aparecer en una transcripción real en
+# español — ver `_contains_non_latin_script` para el motivo. No exhaustivo (faltan armenio,
+# georgiano, etc.), cubre los scripts vistos en vivo en alucinaciones reales de
+# `gpt-4o-transcribe` esta noche (árabe) más los candidatos más probables del mismo patrón.
+_NON_LATIN_SCRIPT_RANGES = (
+    (0x0370, 0x03FF),  # griego
+    (0x0400, 0x04FF),  # cirílico
+    (0x0590, 0x05FF),  # hebreo
+    (0x0600, 0x06FF),  # árabe
+    (0x0750, 0x077F),  # árabe suplementario
+    (0x0900, 0x097F),  # devanagari
+    (0x0E00, 0x0E7F),  # thai
+    (
+        0x3000,
+        0x303F,
+    ),  # puntuación/símbolos CJK (ej. "。", el ideographic full stop) — gap
+    # real encontrado en vivo revisando `data/jarvis.db`: una alucinación de un solo carácter de
+    # este bloque quedó guardada en `conversation_turns` sin que el filtro original (que solo
+    # cubría rangos de "letras") la agarrara, porque este bloque es puntuación, no un script de
+    # letras — pero es igual de imposible en una transcripción real en español.
+    (0x3040, 0x30FF),  # hiragana/katakana
+    (0x4E00, 0x9FFF),  # ideogramas CJK
+    (0xAC00, 0xD7A3),  # hangul
+)
+
+
+def _contains_non_latin_script(text: str) -> bool:
+    """`True` si `text` contiene algún carácter de un script no latino (árabe, cirílico, CJK,
+    etc.) — señal inequívoca de alucinación de `jarvis.audio.stt.transcribe()` sobre audio poco
+    claro (ruido de fondo, voces superpuestas que sí cruzan el umbral de silencio pero no son el
+    usuario), no una transcripción real: `LANGUAGE = "es"` (`jarvis.audio.stt`) fija el idioma
+    esperado, y una transcripción legítima en español nunca usa estos scripts — a diferencia de
+    palabras sueltas o gramaticalmente rotas en alfabeto latino (ambiguas, esas si pueden ser
+    habla real mal transcripta y no se filtran acá). Bug real, en vivo, mismo mic ya calibrado:
+    `Dijiste: 'أفهمت؟'` sobre audio de fondo, sin que el usuario dijera nada en árabe — mismo
+    espíritu que la mitigación ya existente para silencio puro (`record_command`/`speech_detected`
+    en `run()`), un filtro más contra la cascada de alucinación de idioma, esta vez sobre audio
+    que sí tenía señal real (solo que no era el usuario)."""
+    return any(
+        any(start <= ord(ch) <= end for start, end in _NON_LATIN_SCRIPT_RANGES)
+        for ch in text
+    )
 
 
 def _format_time_ago(created_at: str, *, now: datetime) -> str:
@@ -1158,6 +1262,27 @@ def run(
         # el stub de `sys` — existe en runtime (stdout/stderr son `TextIOWrapper` de verdad),
         # mypy no lo sabe.
         stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    # Sin esto, cualquier `logging.getLogger(__name__).info/.debug(...)` de este codebase
+    # (`jarvis.league.lcu_monitor`, ahora `jarvis.audio.stt`) es un no-op silencioso: sin ningún
+    # handler configurado en ningún punto del proceso, Python usa el "handler de último recurso"
+    # (`logging.lastResort`), que solo emite WARNING o más grave — `logger.exception` (ERROR) ya
+    # se veía en `jarvis-error.log`, pero INFO/DEBUG nunca llegaban a ningún lado pese a que el
+    # código los loguea como si fueran a aparecer. A stderr (mismo stream que ya reconfiguramos
+    # arriba y que el lanzador de la Tarea Programada redirige a `jarvis-error.log`) — no a
+    # stdout, que es donde van los `print()` de la transcripción de la conversación
+    # ("Dijiste:"/"JARVIS:") en `jarvis.log`, para no mezclar ambos tipos de contenido.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+    # `basicConfig(level=INFO)` sube el nivel de TODOS los loggers del proceso, no solo los de
+    # `jarvis.*` — sin esto, cada llamada HTTP de `httpx`/`httpcore` (LLM, STT, TTS, clima,
+    # búsqueda) loguearía una línea "HTTP Request: ..." por request, inundando
+    # `jarvis-error.log` con ruido de red en vez de la información de diagnóstico real que se
+    # busca. Solo estos tres — más silencioso solo si aparece más ruido en vivo.
+    for _noisy_logger_name in ("httpx", "httpcore", "openai"):
+        logging.getLogger(_noisy_logger_name).setLevel(logging.WARNING)
     load_dotenv()
     wake_model = load_wake_word_model()
     stt_client = load_stt_client()
@@ -1357,6 +1482,12 @@ def run(
                         text = ""
                     else:
                         text = transcribe(command_audio, client=stt_client)
+                        if _contains_non_latin_script(text):
+                            # Alucinación confirmada en vivo (ver docstring de
+                            # `_contains_non_latin_script`) — se descarta acá, antes del print y
+                            # de `save_speech_sample` más abajo, para que ni contamine el log ni
+                            # la memoria de estilo de habla con texto que el usuario nunca dijo.
+                            text = ""
                     print(f"Dijiste: {text!r}")
                     if text.strip():
                         # Log automático, sin juicio del LLM (a diferencia de `remember_fact`):
