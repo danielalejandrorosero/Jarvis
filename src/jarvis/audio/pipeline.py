@@ -135,6 +135,8 @@ from jarvis.memory.store import (
 )
 from jarvis.security.policy import PolicyEngine
 from jarvis.tools.base import Tool
+from jarvis.tools.cancel_reminder import CancelAllRemindersTool, CancelReminderTool
+from jarvis.tools.cancel_timer import CancelAllTimersTool, CancelTimerTool
 from jarvis.tools.close_app import CloseAppTool
 from jarvis.tools.lol_champion_select import LockChampionTool, PreviewChampionTool
 from jarvis.tools.lol_runes import SetRunesTool
@@ -276,8 +278,10 @@ SYSTEM_PROMPT = (
     "aplicaciones instaladas en la computadora, abrir sitios web, cerrar aplicaciones que estén "
     "corriendo, y recordar datos del usuario para futuras conversaciones. Podés controlar la "
     "reproducción multimedia que esté sonando (media_control: pausar, reanudar, siguiente, "
-    "anterior, detener) y el volumen general (volume_control: subir, bajar, silenciar) sin "
-    "importar qué app la esté reproduciendo. Podés reportar el estado de la computadora "
+    "anterior, detener) y el volumen general (volume_control: subir/bajar un paso, silenciar, o "
+    "fijarlo a un porcentaje exacto con el parámetro level si el usuario da un número, ej. "
+    "'poné el volumen en 30%') sin importar qué app la esté reproduciendo. Podés reportar el "
+    "estado de la computadora "
     "(system_info: uso de CPU, RAM y, si hay, GPU) cuando el usuario pregunte cómo anda de "
     "recursos o si está lenta. Podés tomar una captura de pantalla y guardarla (screenshot) "
     "cuando el usuario lo pida. "
@@ -327,7 +331,18 @@ SYSTEM_PROMPT = (
     "una duración directa en segundos; set_reminder necesita que VOS calcules en cuántos "
     "segundos a partir de AHORA corresponde avisar, usando la fecha y hora actual que te doy "
     "más abajo en estas instrucciones (buscá la línea 'Fecha y hora actual') — nunca le pidas "
-    "al usuario que haga esa cuenta. "
+    "al usuario que haga esa cuenta. Para cancelar UN timer o recordatorio puntual antes de que "
+    "se cumpla usá cancel_timer o cancel_reminder respectivamente (ej. 'cancelá el timer de la "
+    "pasta', 'cancelá mi último recordatorio') — pasales en target la etiqueta o texto con el "
+    "que se identificó al ponerlo, o la palabra 'último' si el usuario no dio más detalle; nunca "
+    "inventes ni le pidas al usuario un identificador numérico, esa resolución la hace la "
+    "herramienta sola contra lo que esté pendiente en este momento. Para cancelar TODOS los "
+    "timers o TODOS los recordatorios pendientes de una sola vez (ej. 'cancelá todos los "
+    "timers', 'borrá todos mis recordatorios') usá cancel_all_timers o cancel_all_reminders en "
+    "vez de repetir cancel_timer/cancel_reminder uno por uno — no aceptan parámetros, y como "
+    "borran todo lo pendiente de una vez le piden confirmación hablada al usuario antes de "
+    "ejecutarse (mismo comportamiento que close_app: si dice que sí se cancela todo, si dice "
+    "que no no pasa nada). "
     "Para abrir un sitio web sin buscar nada primero (ej. 'abrí YouTube', 'abrí Wikipedia') usá "
     "la herramienta open_url armando vos mismo la URL en https://. "
     "Para escuchar/ver/reproducir algo específico (ej. 'escuchá tal canción', 'buscá tal video en "
@@ -1067,6 +1082,10 @@ def run(
             CloseAppTool(),
             TimerTool(scheduler=timer_scheduler),
             ReminderTool(),
+            CancelTimerTool(scheduler=timer_scheduler),
+            CancelReminderTool(),
+            CancelAllTimersTool(scheduler=timer_scheduler),
+            CancelAllRemindersTool(),
             MediaControlTool(),
             VolumeControlTool(),
             SystemInfoTool(),

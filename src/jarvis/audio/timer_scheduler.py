@@ -23,7 +23,7 @@ audio/pipeline, análoga a `SystemAudioMonitor`.
 Dos fuentes de items pendientes, con ciclos de vida distintos (ver docstring de
 `jarvis.memory.store` para la justificación completa):
 
-- **Timers**: puramente en memoria (`_PendingTimer`, lista protegida por `_lock`) — efímeros,
+- **Timers**: puramente en memoria (`PendingTimer`, lista protegida por `_lock`) — efímeros,
   minutos de vida típica, no sobreviven un reinicio de JARVIS (aceptado como degradación menor).
 - **Recordatorios**: persistidos en SQLite (`jarvis.memory.store.reminders`, vía `save_reminder`/
   `list_due_reminders`/`delete_reminder`) — pueden tener horas o días de vida, así que sí
@@ -71,8 +71,13 @@ MAX_PENDING_TIMERS = 100
 
 
 @dataclass
-class _PendingTimer:
-    """Un timer en memoria (ver docstring del módulo: nunca persiste a disco)."""
+class PendingTimer:
+    """Un timer en memoria (ver docstring del módulo: nunca persiste a disco), expuesto en
+    lectura para que un tool de cancelación (`jarvis.tools.cancel_timer`) pueda resolver un
+    pedido en lenguaje natural ("cancelá el timer de la pasta", "cancelá mi último timer")
+    contra la lista de timers *actualmente* pendientes, sin que el LLM tenga que conocer ni decir
+    un id interno — mismo problema y misma solución que la resolución por nombre de
+    `close_app`/`lock_lol_champion` (ver `.claude/rules/agents.md` y esos módulos)."""
 
     id: int
     label: str | None
@@ -98,7 +103,7 @@ class TimerScheduler:
         self._tts = tts
         self._db_path = db_path
         self._poll_interval = poll_interval_seconds
-        self._timers: list[_PendingTimer] = []
+        self._timers: list[PendingTimer] = []
         self._next_timer_id = 1
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -109,8 +114,10 @@ class TimerScheduler:
     ) -> int | None:
         """Registrar un timer en memoria que vence en `seconds` a partir de `now` (default:
         ahora mismo, UTC). Devuelve un id local (solo único dentro de este `TimerScheduler`, no
-        persistido) — no lo usa nadie todavía, pero deja la puerta abierta a un futuro
-        "cancelá el timer" sin tener que cambiar esta firma.
+        persistido) — usado por `cancel_timer` para cancelarlo antes de que venza (el llamador
+        típico, `jarvis.tools.timer.TimerTool`, descarta este valor de retorno: la resolución de
+        "qué timer cancelar" a partir de lenguaje natural vive en `jarvis.tools.cancel_timer`,
+        contra `list_pending_timers`, no acá).
 
         Devuelve `None` en vez de registrar nada si ya hay `MAX_PENDING_TIMERS` timers pendientes
         — el llamador (`jarvis.tools.timer.TimerTool.execute`) es responsable de convertir ese
@@ -127,15 +134,42 @@ class TimerScheduler:
                 return None
             timer_id = self._next_timer_id
             self._next_timer_id += 1
-            self._timers.append(
-                _PendingTimer(id=timer_id, label=label, fire_at=fire_at)
-            )
+            self._timers.append(PendingTimer(id=timer_id, label=label, fire_at=fire_at))
         return timer_id
+
+    def cancel_timer(self, timer_id: int) -> bool:
+        """Cancelar el timer pendiente `timer_id` (el id devuelto por `schedule_timer`), sin
+        anunciarlo — a diferencia de `_announce_due_timers`, acá se descarta en silencio porque
+        cancelar es justamente lo contrario de "avisame cuando se cumpla".
+
+        Devuelve `True` si había un timer con ese id (y quedó cancelado), `False` si no existía
+        (ya venció y se anunció, ya se canceló antes, o nunca existió) — idempotente, mismo
+        contrato que `jarvis.memory.store.delete_reminder`. El llamador (`jarvis.tools.
+        cancel_timer.CancelTimerTool`) es responsable de resolver un pedido en lenguaje natural
+        a un `timer_id` concreto ANTES de llamar a esto (ver `list_pending_timers`) — este método
+        no hace fuzzy-matching, solo opera sobre un id ya resuelto.
+        """
+        with self._lock:
+            remaining = [timer for timer in self._timers if timer.id != timer_id]
+            cancelled = len(remaining) != len(self._timers)
+            self._timers = remaining
+        return cancelled
+
+    def list_pending_timers(self) -> list[PendingTimer]:
+        """Devolver una copia de los timers en memoria que todavía no vencieron — para que un
+        tool de cancelación pueda resolver "el timer de la pasta"/"mi último timer"/"todos" contra
+        el estado actual sin tener que exponer `_timers` (protegido por `_lock`) directamente.
+
+        Copia superficial (`list(...)`, no la lista interna): quien llama a esto puede iterar o
+        filtrar sin arriesgar una mutación concurrente de la lista real mientras el poll loop de
+        fondo corre en su propio thread.
+        """
+        with self._lock:
+            return list(self._timers)
 
     @property
     def pending_timer_count(self) -> int:
-        """Cuántos timers en memoria siguen sin vencer — expuesto para tests, sin usarse en
-        producción todavía."""
+        """Cuántos timers en memoria siguen sin vencer — expuesto para tests."""
         with self._lock:
             return len(self._timers)
 

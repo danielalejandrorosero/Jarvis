@@ -15,6 +15,11 @@ dependencies = [
     "playsound3>=3.0",
     "psutil>=6.0",  # system_info: CPU/RAM sin WMI verboso/inestable (jarvis.tools.system_info)
     "Pillow>=10.0",  # screenshot: PIL.ImageGrab sin GDI a mano via ctypes (jarvis.tools.screenshot)
+    "pycaw>=20220416",  # volume_control: nivel exacto de volumen via IAudioEndpointVolume, la
+    # Core Audio API de Windows no tiene equivalente en stdlib ni via keybd_event (solo pasos
+    # gruesos) — pycaw es la envoltura estándar y ampliamente usada de esa API COM en el
+    # ecosistema Python-Windows (jarvis.tools.volume_control). `comtypes`, de la que depende, ya
+    # era una dependencia transitiva existente (via pyttsx3).
 ]
 
 [project.optional-dependencies]
@@ -37,7 +42,16 @@ python_version = "3.12"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["sounddevice", "soundcard", "openwakeword.*", "pyttsx3.*", "playsound3.*"]
+module = [
+    "sounddevice",
+    "soundcard",
+    "openwakeword.*",
+    "pyttsx3.*",
+    "playsound3.*",
+    "comtypes",
+    "comtypes.*",
+    "pycaw.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

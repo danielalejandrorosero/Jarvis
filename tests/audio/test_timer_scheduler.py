@@ -262,6 +262,86 @@ def test_poll_once_announces_both_a_due_timer_and_a_due_reminder(
     assert set(tts.calls) == {"¡Se cumplió tu timer!", "Recordatorio: llamar a mamá"}
 
 
+# --- cancel_timer() / list_pending_timers() (cancelación de timers, jarvis.tools.cancel_timer) --
+
+
+def test_cancel_timer_removes_a_pending_timer_and_returns_true() -> None:
+    scheduler = TimerScheduler(tts=_SpyTTSClient())
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    timer_id = scheduler.schedule_timer(seconds=600, label="la pasta", now=now)
+    assert timer_id is not None
+
+    cancelled = scheduler.cancel_timer(timer_id)
+
+    assert cancelled is True
+    assert scheduler.pending_timer_count == 0
+
+
+def test_cancel_timer_does_not_announce_the_cancelled_timer() -> None:
+    tts = _SpyTTSClient()
+    scheduler = TimerScheduler(tts=tts)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    timer_id = scheduler.schedule_timer(seconds=60, now=now)
+    assert timer_id is not None
+
+    scheduler.cancel_timer(timer_id)
+    scheduler.poll_once(now=now + timedelta(seconds=60))
+
+    assert tts.calls == []
+
+
+def test_cancel_timer_returns_false_for_an_unknown_id() -> None:
+    scheduler = TimerScheduler(tts=_SpyTTSClient())
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    scheduler.schedule_timer(seconds=60, now=now)
+
+    cancelled = scheduler.cancel_timer(999)
+
+    assert cancelled is False
+    assert scheduler.pending_timer_count == 1
+
+
+def test_cancel_timer_is_idempotent_on_the_same_id() -> None:
+    scheduler = TimerScheduler(tts=_SpyTTSClient())
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    timer_id = scheduler.schedule_timer(seconds=60, now=now)
+    assert timer_id is not None
+    assert scheduler.cancel_timer(timer_id) is True
+
+    assert scheduler.cancel_timer(timer_id) is False
+
+
+def test_cancel_timer_only_removes_the_targeted_timer() -> None:
+    scheduler = TimerScheduler(tts=_SpyTTSClient())
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    first_id = scheduler.schedule_timer(seconds=60, label="uno", now=now)
+    second_id = scheduler.schedule_timer(seconds=120, label="dos", now=now)
+    assert first_id is not None and second_id is not None
+
+    scheduler.cancel_timer(first_id)
+
+    remaining = scheduler.list_pending_timers()
+    assert [timer.id for timer in remaining] == [second_id]
+
+
+def test_list_pending_timers_returns_a_snapshot_of_pending_timers() -> None:
+    scheduler = TimerScheduler(tts=_SpyTTSClient())
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    first_id = scheduler.schedule_timer(seconds=60, label="uno", now=now)
+    second_id = scheduler.schedule_timer(seconds=120, label="dos", now=now)
+
+    pending = scheduler.list_pending_timers()
+
+    assert {timer.id for timer in pending} == {first_id, second_id}
+    assert {timer.label for timer in pending} == {"uno", "dos"}
+
+
+def test_list_pending_timers_is_empty_when_nothing_is_pending() -> None:
+    scheduler = TimerScheduler(tts=_SpyTTSClient())
+
+    assert scheduler.list_pending_timers() == []
+
+
 # --- lifecycle start()/stop() (idempotencia, no timing) -----------------------------------------
 
 
