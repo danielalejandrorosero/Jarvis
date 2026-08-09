@@ -148,6 +148,7 @@ from jarvis.tools.lol_start_queue import (
 from jarvis.tools.lol_summoner_spells import SetSummonerSpellsTool
 from jarvis.tools.media_control import MediaControlTool
 from jarvis.tools.open_app import OpenAppTool
+from jarvis.tools.open_file import OpenFileTool
 from jarvis.tools.open_url import OpenUrlTool
 from jarvis.tools.remember import RememberTool
 from jarvis.tools.reminder import ReminderTool
@@ -273,7 +274,13 @@ SYSTEM_PROMPT = (
     "audio ambiguo o ruido de fondo, no algo que el usuario realmente dijo, y aunque lo fuera vos "
     "respondés en español igual) — esta regla pisa cualquier pista de idioma del texto de "
     "entrada, siempre, no es una preferencia. Porque tu respuesta se lee en voz alta, así que "
-    "nada de listas, markdown, ni símbolos que no se puedan pronunciar. Podés consultar el clima "
+    "nada de listas, markdown, ni símbolos que no se puedan pronunciar. Por el mismo motivo, tu "
+    "respuesta tiene que ser ÚNICAMENTE la frase final dirigida al usuario — nunca antepongas tu "
+    "razonamiento interno, un análisis en tercera persona de lo que dijo el usuario ('el usuario "
+    "está preguntando...', 'esto parece referirse a...'), ni notas dirigidas a vos mismo sobre "
+    "qué deberías responder ('debo pedir aclaración...', 'voy a...'): pensá eso puertas adentro, "
+    "sin escribirlo, porque todo lo que aparece en tu respuesta se lee en voz alta tal cual, sin "
+    "distinguir razonamiento de respuesta real. Podés consultar el clima "
     "de una ciudad, buscar información en la web, abrir "
     "aplicaciones instaladas en la computadora, abrir sitios web, cerrar aplicaciones que estén "
     "corriendo, y recordar datos del usuario para futuras conversaciones. Podés controlar la "
@@ -284,7 +291,10 @@ SYSTEM_PROMPT = (
     "estado de la computadora "
     "(system_info: uso de CPU, RAM y, si hay, GPU) cuando el usuario pregunte cómo anda de "
     "recursos o si está lenta. Podés tomar una captura de pantalla y guardarla (screenshot) "
-    "cuando el usuario lo pida. "
+    "cuando el usuario lo pida. Cuando el usuario pida abrir o ver algo que JARVIS mismo generó "
+    "hace poco (ej. 'abrí la captura' después de usar screenshot), usá open_local_file con la "
+    "ruta que te devolvió esa herramienta en su resultado o en el historial — no open_app ni "
+    "open_url, que no sirven para rutas de archivo local. "
     "Para League of Legends tenés varias herramientas más, que solo funcionan mientras League of "
     "Legends está corriendo y en la fase correspondiente del juego — si no lo está, o no está "
     "en esa fase ahora mismo, la herramienta te va a devolver un mensaje claro en vez de "
@@ -1078,6 +1088,7 @@ def run(
             SearchTool(),
             RememberTool(),
             OpenAppTool(),
+            OpenFileTool(),
             OpenUrlTool(),
             CloseAppTool(),
             TimerTool(scheduler=timer_scheduler),

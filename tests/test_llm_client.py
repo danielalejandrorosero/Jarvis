@@ -31,13 +31,24 @@ from jarvis.llm.client import (
 
 
 def _fake_response(
-    content: str | None, *, tool_calls: list[MagicMock] | None = None
+    content: str | None,
+    *,
+    tool_calls: list[MagicMock] | None = None,
+    reasoning_content: str | None = None,
 ) -> MagicMock:
     """Construye un stub de `ChatCompletion` con `.choices[0].message.content = content` y,
-    opcionalmente, `.choices[0].message.tool_calls`."""
+    opcionalmente, `.choices[0].message.tool_calls`.
+
+    `reasoning_content=None` (default) simula el caso normal: la API no devolvió ese campo extra
+    (`_fake_response` lo setea explícito, en vez de dejar que `MagicMock` autogenere un atributo
+    truthy en cualquier acceso, que rompería la premisa de estos tests) — solo los tests que
+    ejercitan `reasoning_content` lo pasan explícito, simulando un modelo "reasoner"/"thinking"
+    que sí separa razonamiento de respuesta final (ver `DeepSeekClient._log_reasoning_content` /
+    `jarvis.llm.client._log_reasoning_content`)."""
     response = MagicMock()
     response.choices[0].message.content = content
     response.choices[0].message.tool_calls = tool_calls
+    response.choices[0].message.reasoning_content = reasoning_content
     return response
 
 
@@ -201,6 +212,50 @@ def test_complete_parsed_tool_call_has_no_arguments_error_on_valid_dict() -> Non
 
     assert result.tool_call is not None
     assert result.tool_call.arguments_error is None
+
+
+def test_complete_never_includes_reasoning_content_in_returned_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regresión de bug confirmado en vivo: JARVIS llegó a hablarle al usuario un párrafo de
+    razonamiento interno ("El usuario está respondiendo... Debo pedir aclaración...") antes de la
+    respuesta real. Si el proveedor separa ese razonamiento del texto final en un campo propio
+    (`reasoning_content` — DeepSeek lo usa para sus modelos "reasoner"/"thinking", y el SDK de
+    `openai` lo preserva como atributo extra vía `pydantic`/`extra=\"allow\"`, aunque no sea parte
+    del schema oficial de OpenAI), `complete()` nunca debe mezclarlo con `text` — se descarta del
+    resultado y se loguea aparte (nivel debug, nunca print/TTS) para debugging."""
+    caplog.set_level("DEBUG", logger="jarvis.llm.client")
+    client, _fake = _client_with(
+        _fake_response(
+            "Me alegro de que te haya quedado bien, Daniel.",
+            reasoning_content=(
+                "El usuario está respondiendo 'Ese está mejor' refiriéndose "
+                "probablemente a algo anterior..."
+            ),
+        )
+    )
+
+    result = client.complete([{"role": "user", "content": "Ese está mejor."}])
+
+    assert result == LLMResult(
+        text="Me alegro de que te haya quedado bien, Daniel.", tool_call=None
+    )
+    assert "El usuario está respondiendo" not in result.text
+    assert any(
+        "razonamiento" in record.message
+        and "El usuario está respondiendo" in record.message
+        for record in caplog.records
+    )
+
+
+def test_complete_omits_reasoning_log_when_field_absent() -> None:
+    """Caso normal (sin modelo `reasoner`): sin `reasoning_content` en la respuesta, `complete()`
+    no loguea nada — no hay ruido de diagnóstico cuando no hay nada que reportar."""
+    client, _fake = _client_with(_fake_response("respuesta normal"))
+
+    result = client.complete([{"role": "user", "content": "hola"}])
+
+    assert result == LLMResult(text="respuesta normal", tool_call=None)
 
 
 def test_load_deepseek_client_from_env_raises_runtime_error_when_key_missing(

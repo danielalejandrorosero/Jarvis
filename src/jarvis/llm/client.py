@@ -16,11 +16,14 @@ DeepSeek-específico; lo DeepSeek-específico (traducir `ToolSchema` al `tools=`
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from openai import OpenAI
+
+logger = logging.getLogger(__name__)
 
 DEEPSEEK_BASE_URL_DEFAULT = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-chat"
@@ -117,6 +120,36 @@ def _parse_tool_arguments(
     return parsed, None
 
 
+def _log_reasoning_content(message: Any) -> None:
+    """Loguear (nunca hablar ni mostrar) el razonamiento interno del modelo, si el proveedor lo
+    devolvió en un campo separado de `content`.
+
+    Motivo: los modelos "reasoner"/"thinking" de DeepSeek devuelven su cadena de razonamiento en
+    `reasoning_content`, un campo propio de la API de DeepSeek que no existe en el schema de
+    OpenAI — pero como `openai.OpenAI` (el SDK que usamos para hablar con la API, compatible con
+    OpenAI) modela sus respuestas con `pydantic` y `extra="allow"` (`openai._models.BaseModel`),
+    ese campo extra queda accesible vía atributo en vez de perderse. Nunca se mezcla con `content`
+    en ningún punto de este módulo — `text` de `LLMResult` siempre sale de `message.content` en
+    limpio — así que esta función es puramente defensiva/de diagnóstico: cubre el caso de que el
+    alias de modelo configurado (`DEEPSEEK_MODEL`) empiece a devolver razonamiento en este campo
+    server-side (p.ej. si DeepSeek migra qué modelo concreto resuelve `deepseek-chat`), sin que
+    haga falta ningún cambio de código para que ese contenido siga sin llegar nunca a TTS.
+
+    Bug real que motivó esto (no hipotético): JARVIS llegó a hablarle al usuario un párrafo de
+    análisis en tercera persona ("El usuario está respondiendo...") seguido recién después de la
+    respuesta real — pero para el modelo/momento en que ocurrió, `reasoning_content` no estaba
+    presente en la respuesta (confirmado leyendo este mismo método: solo toca `message.content`,
+    nunca ningún otro campo); el texto de análisis venía ya mezclado *dentro* de `content`. La
+    causa real de ese caso es una instrucción faltante en `SYSTEM_PROMPT`
+    (`jarvis.audio.pipeline`), no un bug de extracción acá — pero como el proveedor sí soporta un
+    campo separado para otros modelos/variantes, esta función cierra ese otro vector por completo
+    en vez de asumir que nunca va a pasar.
+    """
+    reasoning_content = getattr(message, "reasoning_content", None)
+    if reasoning_content:
+        logger.debug("(razonamiento, no hablado) %s", reasoning_content)
+
+
 def _to_openai_tool_param(schema: ToolSchema) -> dict[str, Any]:
     return {
         "type": "function",
@@ -146,6 +179,7 @@ class DeepSeekClient:
             create_kwargs["tools"] = [_to_openai_tool_param(schema) for schema in tools]
         response = self._client.chat.completions.create(**create_kwargs)
         message = response.choices[0].message
+        _log_reasoning_content(message)
         tool_calls = getattr(message, "tool_calls", None)
         if tool_calls:
             first_call = tool_calls[0]

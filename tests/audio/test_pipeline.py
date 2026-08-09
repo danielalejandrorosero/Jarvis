@@ -819,6 +819,23 @@ def test_system_prompt_instructs_llm_not_to_remember_web_data_content() -> None:
     assert pipeline.WEB_DATA_OPEN_TAG in pipeline.SYSTEM_PROMPT
 
 
+def test_system_prompt_forbids_narrating_internal_reasoning_inline() -> None:
+    """Regresión de bug confirmado en vivo (`data/jarvis.log`): JARVIS llegó a hablarle al
+    usuario un párrafo de análisis en tercera persona sobre lo que dijo ("El usuario está
+    respondiendo...") y notas dirigidas a sí mismo ("Debo pedir aclaración...") antes de la
+    respuesta real — texto de razonamiento interno, mezclado dentro de la misma respuesta que se
+    lee en voz alta. Root cause confirmado leyendo `DeepSeekClient.complete()`
+    (`jarvis.llm.client`): el modelo configurado (`deepseek-chat`, no `deepseek-reasoner`) no
+    devolvió ese razonamiento en un campo separado de la API (`content` es lo único que se lee, y
+    ninguna otra ruta del código lo concatena) — el modelo lo escribió directamente adentro de
+    `content`. La mitigación en este nivel (SYSTEM_PROMPT) es una instrucción explícita, no una
+    garantía dura de infraestructura (a diferencia de la clasificación SAFE/CONFIRM/DANGEROUS de
+    `.claude/rules/security.md`): es el mismo mecanismo que ya usa `SYSTEM_PROMPT` para otras
+    reglas de formato de salida hablada (ej. "nada de listas, markdown")."""
+    assert "razonamiento interno" in pipeline.SYSTEM_PROMPT
+    assert "se lee en voz alta tal cual" in pipeline.SYSTEM_PROMPT
+
+
 def test_system_prompt_extends_web_data_prohibitions_to_conversation_history() -> None:
     """Hallazgo HIGH de `security-reviewer` sobre el historial de conversación: una
     `assistant_text` pasada puede haber citado contenido de `<web_data>` sin conservar esa marca
