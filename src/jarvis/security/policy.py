@@ -13,9 +13,13 @@ directamente.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from jarvis.tools.base import RiskLevel, Tool
+
+logger = logging.getLogger(__name__)
 
 
 class ConfirmationChannel(Protocol):
@@ -46,9 +50,37 @@ class PolicyEngine:
     def __init__(self, confirmation: ConfirmationChannel) -> None:
         self._confirmation = confirmation
 
-    async def authorize_and_execute(self, tool: Tool, kwargs: dict[str, Any]) -> str:
+    async def authorize_and_execute(
+        self,
+        tool: Tool,
+        kwargs: dict[str, Any],
+        *,
+        on_executed: Callable[[], None] | None = None,
+    ) -> str:
+        """Autorizar `tool` según su `RiskLevel` y, si corresponde, ejecutarlo.
+
+        `on_executed`, si se pasa, se llama sin argumentos una única vez, y únicamente después de
+        que `tool.execute()` ya devolvió con éxito — nunca antes, y nunca en el caso CONFIRM
+        denegado ni en el caso DANGEROUS (esos branches no llegan a llamar `tool.execute()`, así
+        que tampoco a `on_executed`). Existe para que un llamador (`jarvis.audio.pipeline.
+        dispatch_turn`, para `jarvis.memory.store.save_tool_call`) pueda saber con certeza que una
+        llamada llegó a ejecutarse de verdad, sin tener que inferirlo parseando el texto de
+        retorno de este método (que es igual de opaco para una llamada SAFE, una CONFIRM
+        aprobada, una CONFIRM denegada o una DANGEROUS rechazada).
+
+        Hallazgo de `security-reviewer`: `on_executed` corre DESPUÉS de que la acción real ya
+        ocurrió (incluida una CONFIRM ya irreversible, ej. `lock_lol_champion`) — si lanzara sin
+        capturar (ej. `save_tool_call` contra SQLite bajo lock contention con el thread de fondo
+        de `TimerScheduler`), la excepción se propagaría antes de `return result` y el usuario se
+        quedaría sin ninguna confirmación hablada de una acción que sí se ejecutó. Por eso se
+        captura acá, ampliamente a propósito (frontera de una capa de recuperación documentada,
+        `.claude/rules/python.md`): un fallo del logging de `on_executed` nunca debe ocultar que
+        la acción principal ya se completó.
+        """
         if tool.risk is RiskLevel.SAFE:
-            return await tool.execute(**kwargs)
+            result = await tool.execute(**kwargs)
+            self._run_on_executed(on_executed)
+            return result
 
         if tool.risk is RiskLevel.CONFIRM:
             approved = await self._confirmation.ask(
@@ -56,7 +88,9 @@ class PolicyEngine:
             )
             if not approved:
                 return f"Acción '{tool.name}' cancelada: no se confirmó."
-            return await tool.execute(**kwargs)
+            result = await tool.execute(**kwargs)
+            self._run_on_executed(on_executed)
+            return result
 
         # RiskLevel.DANGEROUS — nunca se ejecuta desde el loop automatizado, ni con
         # confirmación de un solo paso (`.claude/rules/security.md`). No hay branch que llame
@@ -65,3 +99,20 @@ class PolicyEngine:
             f"Acción '{tool.name}' clasificada como DANGEROUS: JARVIS no la ejecuta "
             "automáticamente. Requiere ejecución manual fuera del agente."
         )
+
+    @staticmethod
+    def _run_on_executed(on_executed: Callable[[], None] | None) -> None:
+        """Invocar `on_executed` (si se pasó) sin dejar que un fallo suyo se propague por encima
+        de un `return result` de una acción que ya se ejecutó de verdad — ver docstring de
+        `authorize_and_execute` para el escenario concreto que motiva esto."""
+        if on_executed is None:
+            return
+        try:
+            on_executed()
+        except Exception:
+            # Frontera de recuperación documentada: la acción principal ya se ejecutó, un fallo
+            # del hook de logging no debe ocultar eso.
+            logger.exception(
+                "on_executed() falló después de una ejecución exitosa del tool "
+                "(la acción real ya se completó, esto solo afecta el registro/log)."
+            )

@@ -7,6 +7,7 @@ testear una función de filesystem: rápido, determinístico, sin mocks de por m
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -16,9 +17,11 @@ from jarvis.memory import store
 from jarvis.memory.store import (
     ConversationTurn,
     Reminder,
+    ToolCallLogEntry,
     delete_reminder,
     list_due_reminders,
     list_facts,
+    list_most_recent_tool_call_per_tool,
     list_recent_conversation_turns,
     list_reminders,
     list_speech_samples,
@@ -26,6 +29,7 @@ from jarvis.memory.store import (
     save_fact,
     save_reminder,
     save_speech_sample,
+    save_tool_call,
 )
 
 
@@ -736,3 +740,169 @@ def test_conversation_turns_are_independent_from_other_tables(tmp_path: Path) ->
     assert list_recent_conversation_turns(db_path=db_path) == [
         ConversationTurn(user_text="un turno", assistant_text="una respuesta")
     ]
+
+
+# --- tool_call_log (log automático de tool-calls que llegaron a ejecutarse; resumen "última fila
+# por tool" resuelve la referencia "la última canción"/"el mismo modo de LoL", ver docstring del
+# módulo) -------------------------------------------------------------------------------------
+
+
+def test_list_most_recent_tool_call_per_tool_on_nonexistent_db_returns_empty_and_creates_it(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "jarvis.db"
+    assert not db_path.exists()
+
+    result = list_most_recent_tool_call_per_tool(db_path=db_path)
+
+    assert result == []
+    assert db_path.exists()
+
+
+def test_save_tool_call_creates_parent_directory_if_missing(tmp_path: Path) -> None:
+    db_path = tmp_path / "nested" / "dir" / "jarvis.db"
+    assert not db_path.parent.exists()
+
+    save_tool_call(
+        "open_url", {"url": "https://youtube.com/watch?v=abc"}, db_path=db_path
+    )
+
+    assert db_path.exists()
+    (entry,) = list_most_recent_tool_call_per_tool(db_path=db_path)
+    assert entry.tool_name == "open_url"
+
+
+def test_save_and_list_tool_call_round_trips_arguments_as_json(tmp_path: Path) -> None:
+    db_path = tmp_path / "jarvis.db"
+
+    save_tool_call("set_lol_lobby_queue", {"queue_type": "arena"}, db_path=db_path)
+
+    (entry,) = list_most_recent_tool_call_per_tool(db_path=db_path)
+    assert isinstance(entry, ToolCallLogEntry)
+    assert entry.tool_name == "set_lol_lobby_queue"
+    assert json.loads(entry.arguments_json) == {"queue_type": "arena"}
+
+
+def test_save_tool_call_strips_surrounding_whitespace_on_tool_name(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "jarvis.db"
+
+    save_tool_call("  open_url  ", {"url": "https://example.com"}, db_path=db_path)
+
+    (entry,) = list_most_recent_tool_call_per_tool(db_path=db_path)
+    assert entry.tool_name == "open_url"
+
+
+def test_save_tool_call_rejects_blank_tool_name(tmp_path: Path) -> None:
+    db_path = tmp_path / "jarvis.db"
+
+    with pytest.raises(ValueError, match="tool_name"):
+        save_tool_call("   ", {}, db_path=db_path)
+    assert list_most_recent_tool_call_per_tool(db_path=db_path) == []
+
+
+def test_save_tool_call_truncates_arguments_longer_than_max_length(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "jarvis.db"
+    overlong_value = "x" * (store.MAX_TOOL_CALL_ARGUMENTS_LENGTH + 200)
+
+    save_tool_call("search_web", {"query": overlong_value}, db_path=db_path)
+
+    (entry,) = list_most_recent_tool_call_per_tool(db_path=db_path)
+    assert len(entry.arguments_json) <= store.MAX_TOOL_CALL_ARGUMENTS_LENGTH + 1
+    assert entry.arguments_json.endswith("…")
+
+
+def test_save_tool_call_prunes_oldest_rows_beyond_max_stored_tool_call_log_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "jarvis.db"
+    monkeypatch.setattr(store, "MAX_STORED_TOOL_CALL_LOG_ROWS", 3)
+
+    for index in range(5):
+        save_tool_call(f"tool_{index}", {"n": index}, db_path=db_path)
+
+    result = list_most_recent_tool_call_per_tool(db_path=db_path)
+
+    assert {entry.tool_name for entry in result} == {"tool_2", "tool_3", "tool_4"}
+
+
+def test_list_most_recent_tool_call_per_tool_keeps_only_latest_call_of_same_tool(
+    tmp_path: Path,
+) -> None:
+    """El insight de diseño clave: varias llamadas al MISMO tool solo dejan UNA fila en el
+    resumen — la más reciente, no un historial que crece con cada llamada."""
+    db_path = tmp_path / "jarvis.db"
+
+    save_tool_call("set_lol_lobby_queue", {"queue_type": "aram"}, db_path=db_path)
+    save_tool_call(
+        "set_lol_lobby_queue", {"queue_type": "ranked_solo_duo"}, db_path=db_path
+    )
+    save_tool_call("set_lol_lobby_queue", {"queue_type": "arena"}, db_path=db_path)
+
+    result = list_most_recent_tool_call_per_tool(db_path=db_path)
+
+    assert len(result) == 1
+    (entry,) = result
+    assert entry.tool_name == "set_lol_lobby_queue"
+    assert json.loads(entry.arguments_json) == {"queue_type": "arena"}
+
+
+def test_list_most_recent_tool_call_per_tool_gives_each_distinct_tool_its_own_row(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "jarvis.db"
+
+    save_tool_call("open_url", {"url": "https://a.example"}, db_path=db_path)
+    save_tool_call("set_lol_lobby_queue", {"queue_type": "arena"}, db_path=db_path)
+    save_tool_call("open_url", {"url": "https://b.example"}, db_path=db_path)
+    save_tool_call("volume_control", {"action": "mute"}, db_path=db_path)
+
+    result = list_most_recent_tool_call_per_tool(db_path=db_path)
+
+    by_name = {entry.tool_name: json.loads(entry.arguments_json) for entry in result}
+    assert by_name == {
+        "open_url": {"url": "https://b.example"},
+        "set_lol_lobby_queue": {"queue_type": "arena"},
+        "volume_control": {"action": "mute"},
+    }
+
+
+def test_list_most_recent_tool_call_per_tool_summary_never_grows_beyond_distinct_tool_count(
+    tmp_path: Path,
+) -> None:
+    """La garantía central de este resumen: sin importar cuántas veces se llame al MISMO puñado
+    de tools, el bloque nunca crece más allá de un renglón por nombre distinto."""
+    db_path = tmp_path / "jarvis.db"
+    tool_names = ["open_url", "set_lol_lobby_queue", "volume_control"]
+
+    for index in range(30):
+        save_tool_call(
+            tool_names[index % len(tool_names)], {"n": index}, db_path=db_path
+        )
+
+    result = list_most_recent_tool_call_per_tool(db_path=db_path)
+
+    assert len(result) == len(tool_names)
+
+
+def test_tool_call_log_is_independent_from_other_tables(tmp_path: Path) -> None:
+    db_path = tmp_path / "jarvis.db"
+    due_at = _iso(datetime.now(UTC) + timedelta(minutes=5))
+
+    save_fact("un hecho", db_path=db_path)
+    save_speech_sample("una muestra de habla", db_path=db_path)
+    save_reminder("un recordatorio", due_at, db_path=db_path)
+    save_conversation_turn("un turno", "una respuesta", db_path=db_path)
+    save_tool_call("open_url", {"url": "https://example.com"}, db_path=db_path)
+
+    assert list_facts(db_path=db_path) == ["un hecho"]
+    assert list_speech_samples(db_path=db_path) == ["una muestra de habla"]
+    assert [r.text for r in list_reminders(db_path=db_path)] == ["un recordatorio"]
+    assert list_recent_conversation_turns(db_path=db_path) == [
+        ConversationTurn(user_text="un turno", assistant_text="una respuesta")
+    ]
+    (entry,) = list_most_recent_tool_call_per_tool(db_path=db_path)
+    assert entry.tool_name == "open_url"

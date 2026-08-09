@@ -61,14 +61,40 @@ automáticamente sin juicio del LLM — cada turno completo que pasa por `dispat
 tal cual. A diferencia de `speech_samples`, cada fila tiene dos campos de texto (lo que dijo el
 usuario y lo que respondió JARVIS), no uno solo. Alcance deliberadamente chico: "últimos N turnos,
 el más viejo se poda primero" alcanza para continuidad conversacional — no es un archivo de
-transcript completo, ni tiene búsqueda ni resumen (ver CLAUDE.md: sin abstracciones prematuras)."""
+transcript completo, ni tiene búsqueda ni resumen (ver CLAUDE.md: sin abstracciones prematuras).
+
+Quinta tabla: `tool_call_log` (`jarvis.audio.pipeline.dispatch_turn`/`_build_system_prompt`).
+Bug real, en vivo, dos veces la misma noche: el usuario pidió "reproducí la última canción que
+pusimos" y, más tarde, "iniciá una partida de LoL pero el mismo modo que estábamos jugando" — en
+ambos casos el pedido original (`open_url` con la URL de la canción; `set_lol_lobby_queue` con
+`queue_type: "arena"`) ya había salido de la ventana acotada de `conversation_turns`
+(`DEFAULT_CONVERSATION_TURN_LIST_LIMIT`), así que el LLM no tenía forma de resolver la referencia.
+`conversation_turns` no se agranda para cubrir esto — un historial más largo sigue siendo una
+ventana que eventualmente se queda corta, y agrandarla infla el prompt entero con turnos
+irrelevantes solo para cubrir un caso puntual. En cambio, `tool_call_log` registra automáticamente
+(sin juicio del LLM, igual que `speech_samples`/`conversation_turns`) cada llamada a un tool que
+efectivamente llegó a ejecutarse — `jarvis.security.policy.PolicyEngine.authorize_and_execute`
+llama a un callback `on_executed` justo después de que `Tool.execute()` devuelve, y ese es el único
+punto en que `dispatch_turn` guarda una fila acá; una llamada denegada por la policy (CONFIRM que
+el usuario rechazó, o cualquier cosa DANGEROUS, que nunca ejecuta) nunca dispara ese callback, así
+que queda naturalmente excluida sin que este módulo tenga que clasificar éxito/fracaso a partir del
+texto de retorno del tool. La clave de diseño, a diferencia de `conversation_turns`: lo que
+`_build_system_prompt` reinyecta no es el historial completo de esta tabla, sino
+`list_most_recent_tool_call_per_tool` — como mucho UNA fila por cada nombre de tool distinto (la
+más reciente), así que ese bloque del prompt nunca crece más allá del número de tools registrados
+en JARVIS, sin importar cuántas llamadas se acumulen históricamente. `MAX_STORED_TOOL_CALL_LOG_ROWS`
+sigue existiendo (mismo patrón de poda por inserción que `speech_samples`/`conversation_turns`)
+como higiene de almacenamiento sobre el historial completo, no como la mitigación de footprint del
+prompt — esa es, otra vez, `list_most_recent_tool_call_per_tool` por construcción."""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 # Relativo al directorio desde el que se corre JARVIS (mismo criterio que
 # `jarvis.config.load_dotenv`'s default `.env`), no un path absoluto hardcodeado — así se puede
@@ -87,8 +113,14 @@ MAX_CONTENT_LENGTH = 500
 
 # Tope duro sobre el total histórico de filas en `facts` (hallazgo LOW #3, menor, no bloqueante):
 # `save_fact` poda las más viejas por encima de este número en cada escritura, así la tabla nunca
-# crece sin límite con el uso prolongado.
-MAX_STORED_FACTS = 500
+# crece sin límite con el uso prolongado. Deliberadamente grande, no una higiene agresiva: pedido
+# explícito del usuario de que la memoria de JARVIS acumule con los meses como la de una persona,
+# no que se pode agresivamente — la poda por prefijo estable (`ORDER BY id DESC LIMIT ?`, sin
+# escaneo completo de tabla) sigue siendo barata en cada escritura aunque el tope sea grande, así
+# que subirlo no tiene costo de performance real a esta escala de uso (asistente personal, no
+# multi-tenant). Distinto de `DEFAULT_LIST_LIMIT`, que sigue acotando cuánto se INYECTA en el
+# prompt de cada turno — almacenar mucho y mostrar poco por turno son cosas separadas.
+MAX_STORED_FACTS = 100_000
 
 # Tope por defecto de `list_speech_samples`: deliberadamente chico frente a `DEFAULT_LIST_LIMIT`
 # (20) — el objetivo es un puñado de ejemplos de estilo recientes y representativos para el
@@ -103,11 +135,11 @@ MAX_SPEECH_SAMPLE_LENGTH = 500
 
 # Tope duro sobre el total histórico de filas en `speech_samples`. Se guarda automáticamente sin
 # juicio del LLM (cada transcripción no vacía), así que la tabla crece mucho más rápido que
-# `facts` con el uso normal — el tope evita que el archivo de DB crezca sin límite indefinidamente
-# con meses de uso diario. No es la mitigación principal de footprint en el prompt (esa es
-# `DEFAULT_SPEECH_SAMPLE_LIST_LIMIT`, que solo importa cuántas de estas filas se leen por turno),
-# es higiene de almacenamiento, igual que `MAX_STORED_FACTS`.
-MAX_STORED_SPEECH_SAMPLES = 300
+# `facts` con el uso normal. No es la mitigación principal de footprint en el prompt (esa es
+# `DEFAULT_SPEECH_SAMPLE_LIST_LIMIT`, que solo importa cuántas de estas filas se leen por turno) —
+# es higiene de almacenamiento, y como tal se sube al mismo orden de magnitud que `MAX_STORED_FACTS`
+# a propósito (mismo pedido del usuario de acumulación a largo plazo, ver comentario ahí).
+MAX_STORED_SPEECH_SAMPLES = 100_000
 
 # Tope duro de longitud por texto de recordatorio — mismo orden de magnitud que
 # `MAX_CONTENT_LENGTH`/`MAX_SPEECH_SAMPLE_LENGTH`, mismo motivo: un recordatorio hablado nunca se
@@ -136,9 +168,26 @@ MAX_CONVERSATION_TURN_TEXT_LENGTH = 500
 # Tope duro sobre el total histórico de filas en `conversation_turns`. Igual que
 # `speech_samples`, se guarda automáticamente sin juicio del LLM (un turno por cada
 # `dispatch_turn` completo), así que crece con el uso normal — mismo orden de magnitud que
-# `MAX_STORED_SPEECH_SAMPLES` (300), higiene de almacenamiento, no la mitigación de footprint del
-# prompt (esa es `DEFAULT_CONVERSATION_TURN_LIST_LIMIT`).
-MAX_STORED_CONVERSATION_TURNS = 300
+# `MAX_STORED_SPEECH_SAMPLES`, higiene de almacenamiento, no la mitigación de footprint del
+# prompt (esa es `DEFAULT_CONVERSATION_TURN_LIST_LIMIT`, que sigue chica a propósito).
+MAX_STORED_CONVERSATION_TURNS = 100_000
+
+# Tope duro de longitud del JSON serializado de `arguments` por fila de `tool_call_log` — mismo
+# orden de magnitud y mismo motivo que `MAX_CONTENT_LENGTH`/`MAX_SPEECH_SAMPLE_LENGTH`/
+# `MAX_CONVERSATION_TURN_TEXT_LENGTH`: los argumentos reales de un tool-call nunca se acercan a
+# esto, existe como red de seguridad ante el caso raro de argumentos anormalmente largos.
+MAX_TOOL_CALL_ARGUMENTS_LENGTH = 500
+
+# Tope duro sobre el total histórico de filas en `tool_call_log`. Se guarda automáticamente sin
+# juicio del LLM (cada tool-call que efectivamente ejecuta), mismo orden de magnitud que
+# `MAX_STORED_SPEECH_SAMPLES`/`MAX_STORED_CONVERSATION_TURNS` — higiene de almacenamiento sobre el
+# historial completo, no la mitigación de footprint del prompt (esa es
+# `list_most_recent_tool_call_per_tool`, que por construcción nunca devuelve más de una fila por
+# nombre de tool distinto, ver docstring del módulo). El historial completo no lo usa ninguna
+# consulta hoy, pero se conserva igual (no solo la última por tool) por si en el futuro hace falta
+# auditoría o una feature que sí mire el pasado completo — barato de guardar, caro de reconstruir
+# si se hubiera podado agresivamente.
+MAX_STORED_TOOL_CALL_LOG_ROWS = 100_000
 
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -174,6 +223,15 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
 )
 """
 
+_CREATE_TOOL_CALL_LOG_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS tool_call_log (
+    id INTEGER PRIMARY KEY,
+    tool_name TEXT NOT NULL,
+    arguments TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
 
 @dataclass(frozen=True)
 class ConversationTurn:
@@ -199,10 +257,26 @@ class Reminder:
     due_at: str
 
 
+@dataclass(frozen=True)
+class ToolCallLogEntry:
+    """Una fila de `tool_call_log` (o del resumen de `list_most_recent_tool_call_per_tool`):
+    `tool_name` es el nombre real registrado del tool (ej. `"set_lol_lobby_queue"`, `"open_url"`),
+    `arguments_json` es el JSON ya serializado de los argumentos con los que se llamó (se guarda
+    y se devuelve tal cual, sin volver a parsearlo a dict — quien lo consume,
+    `jarvis.audio.pipeline._build_system_prompt`, solo necesita mostrarlo, no operar sobre él), y
+    `created_at` es ISO 8601 (UTC) en texto, igual que el resto de las tablas de este módulo — sin
+    formatear a "hace X min" acá: eso se calcula en el punto de renderizado, contra la hora actual
+    en ese momento, no la hora en que se guardó la fila."""
+
+    tool_name: str
+    arguments_json: str
+    created_at: str
+
+
 def _connect(db_path: str | Path) -> sqlite3.Connection:
     """Abrir una conexión a `db_path`, creando el directorio contenedor y las tablas `facts`,
-    `speech_samples`, `reminders` y `conversation_turns` si todavía no existen — cubre tanto el
-    primer uso (archivo de DB inexistente) como usos posteriores (tablas ya creadas,
+    `speech_samples`, `reminders`, `conversation_turns` y `tool_call_log` si todavía no existen —
+    cubre tanto el primer uso (archivo de DB inexistente) como usos posteriores (tablas ya creadas,
     `CREATE TABLE IF NOT EXISTS` es un no-op)."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -211,6 +285,7 @@ def _connect(db_path: str | Path) -> sqlite3.Connection:
     conn.execute(_CREATE_SPEECH_SAMPLES_TABLE_SQL)
     conn.execute(_CREATE_REMINDERS_TABLE_SQL)
     conn.execute(_CREATE_CONVERSATION_TURNS_TABLE_SQL)
+    conn.execute(_CREATE_TOOL_CALL_LOG_TABLE_SQL)
     conn.commit()
     return conn
 
@@ -558,6 +633,91 @@ def list_recent_conversation_turns(
         )
         return [
             ConversationTurn(user_text=row[0], assistant_text=row[1])
+            for row in cursor.fetchall()
+        ]
+    finally:
+        conn.close()
+
+
+def save_tool_call(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> None:
+    """Guardar una fila de log: `tool_name` (el nombre real registrado del tool, ej.
+    `"set_lol_lobby_queue"`) y `arguments` (el dict de kwargs con los que se llamó, serializado a
+    JSON con claves ordenadas para que el mismo llamado produzca siempre el mismo texto) con la
+    marca de tiempo actual (UTC, ISO 8601), truncado a `MAX_TOOL_CALL_ARGUMENTS_LENGTH`.
+
+    Quien llama a esto (`jarvis.security.policy.PolicyEngine.authorize_and_execute`, vía el
+    callback `on_executed` que invoca `jarvis.audio.pipeline.dispatch_turn`) lo hace únicamente
+    después de que `Tool.execute()` ya devolvió, nunca antes — no hay juicio del LLM de por medio
+    ni clasificación de éxito/fracaso a partir de texto acá: "llegó a ejecutarse" ya lo decidió la
+    policy (ver docstring del módulo).
+
+    Lanza `ValueError` si `tool_name` está vacío o es solo espacios — mismo criterio mínimo que el
+    resto de los `save_*` de este módulo; en la práctica no debería poder pasar, porque el nombre
+    viene siempre de un `Tool` ya registrado, no de texto libre.
+
+    Poda las filas más viejas por encima de `MAX_STORED_TOOL_CALL_LOG_ROWS` tras insertar, en la
+    misma transacción — mismo patrón que `save_speech_sample`/`save_conversation_turn`.
+    """
+    stripped_tool_name = tool_name.strip()
+    if not stripped_tool_name:
+        raise ValueError("tool_name no puede estar vacío")
+    serialized_arguments = _truncate(
+        json.dumps(arguments, ensure_ascii=False, sort_keys=True),
+        max_chars=MAX_TOOL_CALL_ARGUMENTS_LENGTH,
+    )
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO tool_call_log (tool_name, arguments, created_at) VALUES (?, ?, ?)",
+            (stripped_tool_name, serialized_arguments, datetime.now(UTC).isoformat()),
+        )
+        conn.execute(
+            "DELETE FROM tool_call_log WHERE id NOT IN "
+            "(SELECT id FROM tool_call_log ORDER BY id DESC LIMIT ?)",
+            (MAX_STORED_TOOL_CALL_LOG_ROWS,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_most_recent_tool_call_per_tool(
+    *, db_path: str | Path = DEFAULT_DB_PATH
+) -> list[ToolCallLogEntry]:
+    """Devolver, para cada `tool_name` DISTINTO que alguna vez se registró, únicamente su fila más
+    reciente — como mucho una fila por nombre de tool, sin importar cuántas llamadas históricas
+    haya en `tool_call_log` (ver docstring del módulo: esto es lo que hace que este bloque del
+    prompt nunca crezca con el uso, a diferencia de `list_recent_conversation_turns`).
+
+    Implementado con una subquery correlacionada (`MAX(id)` por `tool_name`), no una función de
+    ventana — más portable entre versiones de `sqlite3` de stdlib y suficientemente simple de leer
+    para el volumen de filas real acá (como mucho una por tool registrado).
+
+    Orden: más reciente primero (mismo contrato que `list_facts`/`list_speech_samples`/
+    `list_recent_conversation_turns`) — quien arma el bloque del prompt
+    (`jarvis.audio.pipeline._build_system_prompt`) puede mostrarlas tal cual, sin necesidad de
+    volver a ordenar.
+
+    Sobre un `db_path` que todavía no existe, o sin ninguna llamada registrada, inicializa la DB
+    vacía y devuelve `[]`, igual que el resto de los `list_*` de este módulo.
+    """
+    conn = _connect(db_path)
+    try:
+        cursor = conn.execute(
+            "SELECT tool_name, arguments, created_at FROM tool_call_log AS t1 "
+            "WHERE id = ("
+            "    SELECT MAX(id) FROM tool_call_log AS t2 "
+            "    WHERE t2.tool_name = t1.tool_name"
+            ") "
+            "ORDER BY id DESC"
+        )
+        return [
+            ToolCallLogEntry(tool_name=row[0], arguments_json=row[1], created_at=row[2])
             for row in cursor.fetchall()
         ]
     finally:
