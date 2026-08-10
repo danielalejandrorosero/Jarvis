@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from jarvis.llm.client import (
+    MAX_COMPLETION_TOKENS,
     TEMPERATURE,
     DeepSeekClient,
     LLMResult,
@@ -106,6 +107,19 @@ def test_complete_sends_deterministic_temperature() -> None:
     _args, kwargs = fake_openai_client.chat.completions.create.call_args
     assert kwargs["temperature"] == TEMPERATURE
     assert "tools" not in kwargs
+
+
+def test_complete_sends_a_hard_output_token_cap() -> None:
+    """`max_tokens` (`jarvis.llm.client.MAX_COMPLETION_TOKENS`) se manda siempre — defensa de
+    raíz contra una respuesta que se extiende sin límite (ver comentario junto a la constante):
+    estructuralmente imposible que el modelo genere más de esto en una sola llamada, sin importar
+    qué tan mal siga la instrucción de `SYSTEM_PROMPT` de responder corto."""
+    client, fake_openai_client = _client_with(_fake_response("ok"))
+
+    client.complete([{"role": "user", "content": "hola"}])
+
+    _args, kwargs = fake_openai_client.chat.completions.create.call_args
+    assert kwargs["max_tokens"] == MAX_COMPLETION_TOKENS
 
 
 def test_complete_passes_tool_schemas_in_openai_wire_format() -> None:

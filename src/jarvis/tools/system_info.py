@@ -76,6 +76,10 @@ def _raw_gpu_stats() -> str | None:
             text=True,
             check=False,
             timeout=_NVIDIA_SMI_TIMEOUT_SECONDS,
+            # Sin esto, Windows abre una ventana de consola visible para `nvidia-smi.exe` cada
+            # vez — mismo bug real encontrado en vivo en `jarvis.league.lcu_monitor`/
+            # `jarvis.tools.close_app` (JARVIS corre vía `pythonw.exe`, sin consola propia).
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired):
         # OSError cubre el caso común: `nvidia-smi` no existe en el PATH (máquina sin GPU NVIDIA,

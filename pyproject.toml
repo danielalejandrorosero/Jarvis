@@ -20,6 +20,22 @@ dependencies = [
     # gruesos) — pycaw es la envoltura estándar y ampliamente usada de esa API COM en el
     # ecosistema Python-Windows (jarvis.tools.volume_control). `comtypes`, de la que depende, ya
     # era una dependencia transitiva existente (via pyttsx3).
+    "websockets>=13,<16",  # requerida en runtime por `client.realtime.connect()`
+    # (jarvis.audio.realtime_stt, transcripción en streaming vía la Realtime API): el propio SDK
+    # de OpenAI la importa de forma perezosa recién al conectar (`openai/resources/realtime/
+    # realtime.py::_connect_ws`) y lanza `OpenAIError` si falta — no es un extra opcional en la
+    # práctica para este módulo, así que se declara como dependencia dura. Rango fijado igual que
+    # el extra oficial `openai[realtime]` (`websockets<16,>=13` en los metadatos instalados de
+    # `openai==2.53.0`), para no divergir de lo que el propio SDK espera.
+    "silero-vad-lite>=0.2.1",  # detector de voz real (jarvis.audio.speech_detector) — reemplaza
+    # el RMS/volumen como criterio de "¿esto es voz?" (confundía ruido fuerte de juego/clics con
+    # habla real, 30% de falsos positivos medidos en vivo). Deliberadamente NO el paquete oficial
+    # `silero-vad`: ese declara `torch>=1.12.0`/`torchaudio>=0.12.0` como dependencias duras
+    # (verificado contra el JSON real de PyPI) — mismo tipo de bloat que ya se descartó para
+    # `noisereduce` (arrastraba `matplotlib`). `silero-vad-lite` tiene cero dependencias pip en
+    # runtime (bundlea ONNX Runtime como extensión compilada, wheels Windows `cp312-win_amd64`
+    # confirmados) — paquete de un solo mantenedor, no el oficial del equipo Silero, trade-off
+    # aceptado a cambio de evitar la dependencia pesada.
 ]
 
 [project.optional-dependencies]
@@ -51,6 +67,7 @@ module = [
     "comtypes",
     "comtypes.*",
     "pycaw.*",
+    "silero_vad_lite",
 ]
 ignore_missing_imports = true
 

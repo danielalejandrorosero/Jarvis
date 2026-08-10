@@ -41,6 +41,23 @@ DEEPSEEK_MODEL = "deepseek-chat"
 # vez de una estimación propia sin más.
 TEMPERATURE = 0.25
 
+# Tope duro de tokens de salida — defensa de raíz, no un parche de texto después del hecho.
+# `jarvis.audio.pipeline._sanitize_final_response` ya descarta una respuesta hablada demasiado
+# larga (bug real, en vivo: el LLM a veces mete su razonamiento interno completo adentro de la
+# respuesta final pese a que `SYSTEM_PROMPT` se lo prohíbe explícitamente), pero eso pasa DESPUÉS
+# de que el modelo ya generó el párrafo entero — desperdicia tokens/latencia real, y sigue siendo
+# "confiar en que el modelo se porte bien, filtrar si no". Un tope acá hace estructuralmente
+# imposible que una sola respuesta se extienda sin límite, sin importar qué tan mal siga la
+# instrucción del prompt. Se evaluó `response_format` con JSON schema estricto (`maxLength` en el
+# campo de texto) como alternativa más fuerte todavía — descartado: confirmado contra la
+# documentación real de DeepSeek que su API no soporta validación de schema, solo `json_object`
+# sin restricciones de campo (a diferencia de los "structured outputs" de OpenAI). 400 tokens
+# (~1600 caracteres) da margen de sobra para cualquier tool-call real de este repo (argumentos de
+# texto libre más largos, ej. `remember_fact`, tienen su propio tope de 500 caracteres,
+# `MAX_CONTENT_LENGTH` en `jarvis.memory.store`) sin arriesgar cortar una llamada a herramienta
+# legítima a mitad de camino.
+MAX_COMPLETION_TOKENS = 400
+
 
 @dataclass(frozen=True)
 class ToolSchema:
@@ -191,6 +208,7 @@ class DeepSeekClient:
             "model": self._model,
             "messages": messages,
             "temperature": TEMPERATURE,
+            "max_tokens": MAX_COMPLETION_TOKENS,
         }
         if tools:
             create_kwargs["tools"] = [_to_openai_tool_param(schema) for schema in tools]

@@ -3,10 +3,19 @@
 
 Una sola tabla, sin esquema clave-valor rígido: quien decide *qué* vale la pena recordar y con
 qué frase es el LLM (`jarvis.tools.remember.RememberTool`), no este módulo — así que el store
-solo necesita texto libre con marca de tiempo, no columnas tipadas por concepto. Nada de RAG ni
-embeddings: el pedido es "acordate de lo que te dije", no búsqueda semántica sobre un corpus
-grande — `sqlite3` de stdlib alcanza (ADR-0004 ya descartó Postgres: sin proceso de servidor para
-una app local de un solo usuario).
+solo necesita texto libre con marca de tiempo, no columnas tipadas por concepto.
+
+`facts` tiene además una columna `embedding` (JSON de floats, `NULL` si no se pudo calcular) —
+pedido explícito del usuario: `_build_system_prompt` solo inyecta los últimos `DEFAULT_LIST_LIMIT`
+hechos por recencia, así que algo dicho hace mucho (ej. "mi color favorito es el azul") se cae del
+prompt aunque siga guardado. `list_facts_with_embeddings` + `jarvis.memory.embeddings` (búsqueda
+semántica vía la API de embeddings de OpenAI — ver docstring de ese módulo para por qué en la nube
+y no local) le da a `RecallMemoryTool` una forma de encontrarlo igual, por significado en vez de
+por las últimas N filas. Revierte la nota anterior de este docstring ("nada de RAG ni embeddings")
+— era la decisión correcta mientras no hacía falta, dejó de serlo con memoria acumulada real.
+`sqlite3` de stdlib sigue alcanzando igual (ADR-0004 ya descartó Postgres: sin proceso de servidor
+para una app local de un solo usuario) — el vector se guarda como columna más, no como una tabla o
+motor de búsqueda vectorial aparte; la cantidad de hechos de un solo usuario nunca justifica eso.
 
 Sin ORM ni dependencia nueva: `sqlite3` (stdlib) es suficiente para una tabla y dos queries.
 
@@ -273,6 +282,18 @@ class ToolCallLogEntry:
     created_at: str
 
 
+def _ensure_facts_embedding_column(conn: sqlite3.Connection) -> None:
+    """Migración liviana: agregar la columna `embedding` a `facts` si todavía no existe — cubre
+    tanto una DB nueva (creada con `_CREATE_TABLE_SQL`, que no la incluye) como una preexistente
+    de antes de esta feature (`data/jarvis.db` real del usuario, con hechos ya guardados sin
+    embedding). `PRAGMA table_info` en vez de `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`: esa
+    sintaxis solo existe en sqlite3 >= 3.35 — chequear la columna a mano es portable sin atarse a
+    una versión mínima."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(facts)").fetchall()}
+    if "embedding" not in columns:
+        conn.execute("ALTER TABLE facts ADD COLUMN embedding TEXT")
+
+
 def _connect(db_path: str | Path) -> sqlite3.Connection:
     """Abrir una conexión a `db_path`, creando el directorio contenedor y las tablas `facts`,
     `speech_samples`, `reminders`, `conversation_turns` y `tool_call_log` si todavía no existen —
@@ -286,6 +307,7 @@ def _connect(db_path: str | Path) -> sqlite3.Connection:
     conn.execute(_CREATE_REMINDERS_TABLE_SQL)
     conn.execute(_CREATE_CONVERSATION_TURNS_TABLE_SQL)
     conn.execute(_CREATE_TOOL_CALL_LOG_TABLE_SQL)
+    _ensure_facts_embedding_column(conn)
     conn.commit()
     return conn
 
@@ -334,13 +356,25 @@ def _truncate(text: str, *, max_chars: int) -> str:
     return text[:max_chars].rstrip() + "…"
 
 
-def save_fact(content: str, *, db_path: str | Path = DEFAULT_DB_PATH) -> None:
+def save_fact(
+    content: str,
+    *,
+    db_path: str | Path = DEFAULT_DB_PATH,
+    embedding: list[float] | None = None,
+) -> None:
     """Guardar `content` (un hecho en texto plano, ej. "el usuario prefiere respuestas cortas")
     con la marca de tiempo actual (UTC, ISO 8601), truncado a `MAX_CONTENT_LENGTH`.
 
     Lanza `ValueError` si `content` está vacío o es solo espacios — validación mínima acá; el
     mensaje amigable de "no se especificó qué recordar" es responsabilidad del tool
     (`jarvis.tools.remember.RememberTool`), no de este módulo de persistencia.
+
+    `embedding`, si se pasa, se guarda junto al hecho como JSON (columna `embedding`,
+    ver `_ensure_facts_embedding_column`) — lo usa `list_facts_with_embeddings` para la búsqueda
+    semántica de `RecallMemoryTool`. Opcional y `None` por defecto a propósito: quien llama
+    (`RememberTool`) calcula el embedding vía una llamada de red a la API de OpenAI que puede
+    fallar, y ese fallo nunca debe impedir guardar el hecho en sí — ver docstring de
+    `jarvis.memory.embeddings` para el porqué de la API en la nube en vez de un modelo local.
 
     Tras insertar, poda las filas más viejas por encima de `MAX_STORED_FACTS` (hallazgo LOW #3)
     — en la misma transacción, así una escritura nunca deja la tabla momentáneamente por encima
@@ -350,11 +384,12 @@ def save_fact(content: str, *, db_path: str | Path = DEFAULT_DB_PATH) -> None:
     if not stripped:
         raise ValueError("content no puede estar vacío")
     truncated = _truncate(stripped, max_chars=MAX_CONTENT_LENGTH)
+    embedding_json = json.dumps(embedding) if embedding is not None else None
     conn = _connect(db_path)
     try:
         conn.execute(
-            "INSERT INTO facts (content, created_at) VALUES (?, ?)",
-            (truncated, datetime.now(UTC).isoformat()),
+            "INSERT INTO facts (content, created_at, embedding) VALUES (?, ?, ?)",
+            (truncated, datetime.now(UTC).isoformat(), embedding_json),
         )
         conn.execute(
             "DELETE FROM facts WHERE id NOT IN "
@@ -381,6 +416,32 @@ def list_facts(
             "SELECT content FROM facts ORDER BY id DESC LIMIT ?", (limit,)
         )
         return [row[0] for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def list_facts_with_embeddings(
+    *, db_path: str | Path = DEFAULT_DB_PATH
+) -> list[tuple[str, list[float]]]:
+    """Devolver `(content, embedding)` de todos los hechos que sí tienen embedding guardado —
+    a diferencia de `list_facts`, sin `limit`: lo usa `RecallMemoryTool` para buscar por
+    significado sobre *todo* lo guardado, no solo lo más reciente (ese es justo el punto —
+    `list_facts`/`DEFAULT_LIST_LIMIT` ya cubre "lo reciente").
+
+    Hechos guardados antes de esta feature, o donde `save_fact(embedding=...)` no recibió nada
+    porque la llamada a la API de OpenAI falló en su momento, tienen `embedding IS NULL` — quedan
+    afuera de este resultado (y de la búsqueda semántica), pero siguen apareciendo en
+    `list_facts` de siempre. No hay backfill automático: son pocos hechos por usuario, no
+    justifica la complejidad de migrar datos existentes.
+    """
+    conn = _connect(db_path)
+    try:
+        cursor = conn.execute(
+            "SELECT content, embedding FROM facts WHERE embedding IS NOT NULL ORDER BY id DESC"
+        )
+        return [
+            (content, json.loads(embedding)) for content, embedding in cursor.fetchall()
+        ]
     finally:
         conn.close()
 

@@ -8,6 +8,7 @@ No tocan un League Client real ni la red real: `_discover_install_dir_from_runni
 
 from __future__ import annotations
 
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Self
@@ -140,6 +141,34 @@ def test_parse_lockfile_returns_none_for_malformed_content(content: str) -> None
 
 def test_read_lockfile_returns_none_when_file_missing(tmp_path: Path) -> None:
     assert lcu_monitor._read_lockfile(tmp_path / "does-not-exist") is None
+
+
+# --- ventana de consola oculta (bug real, en vivo) ----------------------------------------------
+# `_discover_install_dir_from_running_process` es el único punto de este módulo que de verdad
+# invoca un subprocess (PowerShell) — llamado cada `WAITING_FOR_CLIENT_POLL_SECONDS` mientras
+# League no esté corriendo, así que sin `creationflags=CREATE_NO_WINDOW` cada llamada abría una
+# ventana de consola visible (JARVIS corre vía `pythonw.exe`, sin consola propia): el usuario lo
+# vio en vivo como "se abren terminales de la nada" cada pocos segundos, jugando.
+
+
+def test_discover_install_dir_from_running_process_hides_console_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict[str, Any] = {}
+
+    class _FakeCompletedProcess:
+        returncode = 1  # no importa el resultado acá, solo los kwargs de la llamada
+        stdout = ""
+
+    def _fake_run(_args: list[str], **kwargs: Any) -> _FakeCompletedProcess:
+        captured_kwargs.update(kwargs)
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    lcu_monitor._discover_install_dir_from_running_process()
+
+    assert captured_kwargs.get("creationflags") == subprocess.CREATE_NO_WINDOW
 
 
 # --- descubrimiento del lockfile -----------------------------------------------------------------

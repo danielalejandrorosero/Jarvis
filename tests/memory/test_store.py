@@ -8,6 +8,7 @@ testear una función de filesystem: rápido, determinístico, sin mocks de por m
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from jarvis.memory.store import (
     delete_reminder,
     list_due_reminders,
     list_facts,
+    list_facts_with_embeddings,
     list_most_recent_tool_call_per_tool,
     list_recent_conversation_turns,
     list_reminders,
@@ -168,6 +170,80 @@ def test_save_fact_prunes_oldest_rows_beyond_max_stored_facts(
     result = list_facts(db_path=db_path, limit=10)
 
     assert result == ["hecho 4", "hecho 3", "hecho 2"]
+
+
+# --- facts.embedding (búsqueda semántica, `jarvis.memory.embeddings`/`RecallMemoryTool`) --------
+
+
+def test_save_fact_without_embedding_leaves_it_out_of_list_facts_with_embeddings(
+    tmp_path: Path,
+) -> None:
+    """`save_fact` sin `embedding` (el default) guarda el hecho igual — sigue apareciendo en
+    `list_facts` — pero no en `list_facts_with_embeddings`, que solo devuelve lo que sí tiene
+    vector guardado."""
+    db_path = tmp_path / "jarvis.db"
+
+    save_fact("hecho sin embedding", db_path=db_path)
+
+    assert list_facts(db_path=db_path) == ["hecho sin embedding"]
+    assert list_facts_with_embeddings(db_path=db_path) == []
+
+
+def test_save_fact_with_embedding_round_trips_through_list_facts_with_embeddings(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "jarvis.db"
+    embedding = [0.1, -0.2, 0.3]
+
+    save_fact("a Daniel le gusta el azul", db_path=db_path, embedding=embedding)
+
+    result = list_facts_with_embeddings(db_path=db_path)
+    assert result == [("a Daniel le gusta el azul", embedding)]
+
+
+def test_list_facts_with_embeddings_returns_most_recent_first(tmp_path: Path) -> None:
+    db_path = tmp_path / "jarvis.db"
+    save_fact("primero", db_path=db_path, embedding=[1.0])
+    save_fact("segundo", db_path=db_path, embedding=[2.0])
+
+    result = list_facts_with_embeddings(db_path=db_path)
+
+    assert [content for content, _ in result] == ["segundo", "primero"]
+
+
+def test_list_facts_with_embeddings_skips_rows_without_one(tmp_path: Path) -> None:
+    """Una mezcla de hechos con y sin embedding (ej. algunos guardados antes de esta feature, o
+    con una llamada a la API que falló en su momento) solo devuelve los que sí lo tienen."""
+    db_path = tmp_path / "jarvis.db"
+    save_fact("con embedding", db_path=db_path, embedding=[1.0, 2.0])
+    save_fact("sin embedding", db_path=db_path)
+
+    result = list_facts_with_embeddings(db_path=db_path)
+
+    assert result == [("con embedding", [1.0, 2.0])]
+
+
+def test_facts_embedding_column_is_added_to_a_preexisting_db_without_it(
+    tmp_path: Path,
+) -> None:
+    """Migración real: una DB creada antes de esta feature (tabla `facts` sin columna
+    `embedding`) no rompe al abrirse de nuevo — `_ensure_facts_embedding_column` la agrega sola,
+    sin perder los hechos ya guardados."""
+    db_path = tmp_path / "jarvis.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE facts (id INTEGER PRIMARY KEY, content TEXT NOT NULL, "
+        "created_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO facts (content, created_at) VALUES ('hecho viejo', '2020-01-01T00:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    assert list_facts(db_path=db_path) == ["hecho viejo"]
+    save_fact("hecho nuevo", db_path=db_path, embedding=[1.0])
+    assert list_facts_with_embeddings(db_path=db_path) == [("hecho nuevo", [1.0])]
 
 
 # --- speech_samples (log automático, sin curación del LLM — distinto de `facts`) ----------------

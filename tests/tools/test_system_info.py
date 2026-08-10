@@ -122,6 +122,28 @@ def test_raw_gpu_stats_returns_none_on_timeout(monkeypatch: pytest.MonkeyPatch) 
 
 def test_parse_gpu_line_rejects_malformed_csv() -> None:
     assert _parse_gpu_line("not,enough") is None
+
+
+def test_raw_gpu_stats_hides_console_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bug real, en vivo: sin `creationflags=CREATE_NO_WINDOW`, `nvidia-smi.exe` abre una
+    ventana de consola visible cada vez (JARVIS corre vía `pythonw.exe`, sin consola propia) —
+    mismo patrón encontrado en `jarvis.league.lcu_monitor`/`jarvis.tools.close_app`."""
+    captured_kwargs: dict[str, object] = {}
+
+    class _FakeCompletedProcess:
+        returncode = 1
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(*_args: object, **kwargs: object) -> _FakeCompletedProcess:
+        captured_kwargs.update(kwargs)
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(system_info_module.subprocess, "run", _fake_run)
+
+    system_info_module._raw_gpu_stats()
+
+    assert captured_kwargs.get("creationflags") == subprocess.CREATE_NO_WINDOW
     assert _parse_gpu_line("a, b, c, d") is None
 
 

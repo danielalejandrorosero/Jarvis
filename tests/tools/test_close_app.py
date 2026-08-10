@@ -9,6 +9,8 @@ procesos reales ni mata nada.
 from __future__ import annotations
 
 import asyncio
+import subprocess
+from typing import Any
 
 import pytest
 
@@ -278,3 +280,52 @@ def test_terminate_process_reports_success_from_taskkill_exit_code(
 
     assert success is True
     assert message == "Listo, cerré chrome."
+
+
+# --- ventana de consola oculta (bug real, en vivo) ----------------------------------------------
+# `_list_running_process_names`/`_terminate_process` invocan `tasklist`/`taskkill` — sin
+# `creationflags=CREATE_NO_WINDOW`, Windows abre una ventana de consola visible cada vez (JARVIS
+# corre vía `pythonw.exe`, sin consola propia) — mismo bug real encontrado en vivo con el mismo
+# patrón en `jarvis.league.lcu_monitor`.
+
+
+def test_list_running_process_names_hides_console_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict[str, Any] = {}
+
+    class _FakeCompletedProcess:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(*_args: object, **kwargs: Any) -> _FakeCompletedProcess:
+        captured_kwargs.update(kwargs)
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(close_app_module.subprocess, "run", _fake_run)
+
+    close_app_module._list_running_process_names()
+
+    assert captured_kwargs.get("creationflags") == subprocess.CREATE_NO_WINDOW
+
+
+def test_terminate_process_hides_console_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict[str, Any] = {}
+
+    class _FakeCompletedProcess:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(*_args: object, **kwargs: Any) -> _FakeCompletedProcess:
+        captured_kwargs.update(kwargs)
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(close_app_module.subprocess, "run", _fake_run)
+
+    close_app_module._terminate_process("chrome.exe")
+
+    assert captured_kwargs.get("creationflags") == subprocess.CREATE_NO_WINDOW

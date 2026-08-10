@@ -168,6 +168,13 @@ def _discover_install_dir_from_running_process() -> Path | None:
     `jarvis.tools.open_app`. Nunca lanza: cualquier fallo (PowerShell no disponible, timeout,
     proceso no encontrado) devuelve `None`, tratado por el llamador igual que "League no está
     corriendo".
+
+    Bug real, en vivo: `LCUAutoAcceptMonitor._run` llama a esto cada `WAITING_FOR_CLIENT_POLL_
+    SECONDS` (5s) mientras League no esté corriendo — sin `creationflags=CREATE_NO_WINDOW`,
+    cada uno de esos `powershell.exe` abría su propia ventana de consola visible (JARVIS corre
+    vía `pythonw.exe`, sin consola propia a la que Windows pueda adjuntar el subproceso, así que
+    crea una nueva) — el usuario lo vio como "se abren terminales de la nada" cada pocos
+    segundos, jugando, sin haber pedido nada.
     """
     try:
         result = subprocess.run(
@@ -186,6 +193,7 @@ def _discover_install_dir_from_running_process() -> Path | None:
             text=True,
             check=False,
             timeout=PROCESS_LOOKUP_TIMEOUT_SECONDS,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

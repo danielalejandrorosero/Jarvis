@@ -31,17 +31,19 @@ from jarvis.audio.pipeline import (
     MIN_SILENCE_RMS_THRESHOLD,
     NOISE_FLOOR_MULTIPLIER,
     NOISE_FLOOR_SUBCHUNKS,
+    NOISE_REDUCTION_FRAME_SAMPLES,
     SAMPLE_RATE,
-    TRAILING_SILENCE_SECONDS,
     calibrate_thresholds,
     chunk_rms,
     is_speech_chunk,
     measure_noise_floor,
     normalize_gain,
+    reduce_background_noise,
     should_stop_recording,
     tee_frames,
 )
 from jarvis.audio.tts import TTSClient
+from jarvis.audio.vad import TRAILING_SILENCE_SECONDS
 from jarvis.llm.client import LLMResult, ToolCall
 from jarvis.memory.store import (
     list_most_recent_tool_call_per_tool,
@@ -161,29 +163,190 @@ def test_normalize_gain_leaves_below_min_peak_audio_unchanged() -> None:
     assert np.array_equal(result, audio)
 
 
-# --- is_speech_chunk (AND-gate contra audio fuerte del sistema, ver `loopback.py`) -----------
+# --- reduce_background_noise ------------------------------------------------------------------
 
 
-def test_is_speech_chunk_true_when_rms_crosses_threshold_and_system_is_quiet() -> None:
-    assert is_speech_chunk(100.0, silence_threshold=50.0, system_is_loud=False) is True
+def _sine_wave(
+    frequency: float, *, seconds: float, amplitude: float = 8000.0
+) -> np.ndarray:
+    t = np.arange(int(seconds * SAMPLE_RATE)) / SAMPLE_RATE
+    return (amplitude * np.sin(2 * np.pi * frequency * t)).astype(np.int16)
 
 
-def test_is_speech_chunk_false_when_rms_below_threshold_even_if_system_is_quiet() -> (
+def test_reduce_background_noise_returns_audio_unchanged_when_shorter_than_one_frame() -> (
     None
 ):
-    assert is_speech_chunk(10.0, silence_threshold=50.0, system_is_loud=False) is False
+    """Audio más corto que una ventana FFT no alcanza para procesar — se devuelve tal cual en
+    vez de fallar."""
+    audio = np.array([100, -100, 50], dtype=np.int16)
+    noise_sample = _sine_wave(500.0, seconds=1.0)
+
+    result = reduce_background_noise(audio, noise_sample=noise_sample)
+
+    assert np.array_equal(result, audio)
 
 
-def test_is_speech_chunk_false_when_system_is_loud_even_if_rms_crosses_threshold() -> (
+def test_reduce_background_noise_attenuates_a_tone_matching_the_noise_profile() -> None:
+    """Caso central: un tono a la misma frecuencia (y amplitud) que el ruido de fondo medido se
+    atenúa fuerte — exactamente lo que se busca (ver docstring de `reduce_background_noise`).
+
+    Se compara solo la región cubierta por al menos un frame completo de overlap-add: la cola
+    final (menos de un `frame_samples`) queda deliberadamente sin procesar — ver el comentario de
+    `covered` en `reduce_background_noise` — así que no participa de esta aserción.
+    """
+    noise_sample = _sine_wave(500.0, seconds=1.0)
+    audio = _sine_wave(500.0, seconds=0.5)
+
+    result = reduce_background_noise(audio, noise_sample=noise_sample)
+
+    covered_region = result[:-NOISE_REDUCTION_FRAME_SAMPLES]
+    assert int(np.abs(covered_region).max()) < int(np.abs(audio).max()) // 2
+
+
+def test_reduce_background_noise_preserves_a_tone_absent_from_the_noise_profile() -> (
     None
 ):
-    """El caso que motiva el gate: un RMS de mic alto por sí solo no alcanza si viene de audio
-    del sistema (juego, música) filtrándose al mic, no del usuario hablando."""
-    assert is_speech_chunk(9000.0, silence_threshold=50.0, system_is_loud=True) is False
+    """Una frecuencia ausente del perfil de ruido (equivalente a una voz real, distinta del
+    zumbido de fondo) se conserva casi intacta — a diferencia de `normalize_gain`, esto no es un
+    filtro de volumen parejo sobre todo el espectro."""
+    noise_sample = _sine_wave(500.0, seconds=1.0)
+    audio = _sine_wave(3000.0, seconds=0.5)
+
+    result = reduce_background_noise(audio, noise_sample=noise_sample)
+
+    original_peak = int(np.abs(audio).max())
+    result_peak = int(np.abs(result).max())
+    assert result_peak > original_peak * 0.8
+
+
+def test_reduce_background_noise_preserves_audio_length() -> None:
+    """Overlap-add tiene que devolver exactamente el mismo largo que entró, incluso cuando no es
+    múltiplo exacto de `frame_samples`/`hop_samples`."""
+    noise_sample = _sine_wave(500.0, seconds=1.0)
+    audio = _sine_wave(3000.0, seconds=0.37)
+
+    result = reduce_background_noise(audio, noise_sample=noise_sample)
+
+    assert len(result) == len(audio)
+
+
+def test_reduce_background_noise_never_overflows_int16_range() -> None:
+    noise_sample = np.zeros(NOISE_REDUCTION_FRAME_SAMPLES * 4, dtype=np.int16)
+    audio = np.full(NOISE_REDUCTION_FRAME_SAMPLES * 3, 32767, dtype=np.int16)
+
+    result = reduce_background_noise(audio, noise_sample=noise_sample)
+
+    assert result.dtype == np.int16
+    assert int(np.abs(result).max()) <= 32767
+
+
+# --- is_speech_chunk (piso de RMS + probabilidad de voz de Silero + gate de audio del sistema) -
+
+
+def test_is_speech_chunk_degrades_to_rms_only_when_no_probability_available() -> None:
+    """`speech_probability=None` (el detector de voz no cargó, ver `speech_detector.
+    load_speech_detector`) degrada al comportamiento de antes de este cambio: RMS por encima del
+    piso, sistema no sonando fuerte, alcanza."""
+    assert (
+        is_speech_chunk(
+            100.0,
+            min_rms_floor=50.0,
+            speech_probability=None,
+            speech_probability_threshold=0.5,
+            system_is_loud=False,
+        )
+        is True
+    )
+
+
+def test_is_speech_chunk_false_when_rms_below_floor_even_without_probability() -> None:
+    assert (
+        is_speech_chunk(
+            10.0,
+            min_rms_floor=50.0,
+            speech_probability=None,
+            speech_probability_threshold=0.5,
+            system_is_loud=False,
+        )
+        is False
+    )
+
+
+def test_is_speech_chunk_false_when_system_is_loud_even_with_high_probability() -> None:
+    """El caso que motiva el gate: RMS alto y probabilidad de voz alta no alcanzan si el sistema
+    está sonando fuerte (juego, música filtrándose al mic, no el usuario hablando) — el gate de
+    sistema gana sobre cualquier otra señal."""
+    assert (
+        is_speech_chunk(
+            9000.0,
+            min_rms_floor=50.0,
+            speech_probability=0.99,
+            speech_probability_threshold=0.5,
+            system_is_loud=True,
+        )
+        is False
+    )
 
 
 def test_is_speech_chunk_false_when_both_rms_low_and_system_loud() -> None:
-    assert is_speech_chunk(5.0, silence_threshold=50.0, system_is_loud=True) is False
+    assert (
+        is_speech_chunk(
+            5.0,
+            min_rms_floor=50.0,
+            speech_probability=None,
+            speech_probability_threshold=0.5,
+            system_is_loud=True,
+        )
+        is False
+    )
+
+
+def test_is_speech_chunk_true_when_probability_crosses_threshold_above_rms_floor() -> (
+    None
+):
+    """Caso central del fix real: RMS por encima del piso Y el modelo de voz confirma que suena
+    a voz — el caso que reemplaza la decisión de solo-RMS de antes."""
+    assert (
+        is_speech_chunk(
+            500.0,
+            min_rms_floor=50.0,
+            speech_probability=0.8,
+            speech_probability_threshold=0.5,
+            system_is_loud=False,
+        )
+        is True
+    )
+
+
+def test_is_speech_chunk_false_when_rms_high_but_probability_says_not_speech() -> None:
+    """El caso real que motivó este cambio: un RMS alto (ruido fuerte no-vocal — clic de mouse,
+    efecto de sonido de un juego) por sí solo YA NO alcanza si el modelo de voz dice que no suena
+    a voz humana — a diferencia del criterio de solo-RMS de antes, que lo hubiera aceptado."""
+    assert (
+        is_speech_chunk(
+            9000.0,
+            min_rms_floor=50.0,
+            speech_probability=0.1,
+            speech_probability_threshold=0.5,
+            system_is_loud=False,
+        )
+        is False
+    )
+
+
+def test_is_speech_chunk_false_when_below_rms_floor_regardless_of_probability() -> None:
+    """El piso de RMS sigue siendo un pre-filtro real: silencio genuino no se reconsidera aunque,
+    por lo que sea, el modelo devuelva una probabilidad alta para ese chunk."""
+    assert (
+        is_speech_chunk(
+            5.0,
+            min_rms_floor=50.0,
+            speech_probability=0.9,
+            speech_probability_threshold=0.5,
+            system_is_loud=False,
+        )
+        is False
+    )
 
 
 # --- should_stop_recording -------------------------------------------------------------------
@@ -304,13 +467,18 @@ def test_measure_noise_floor_uses_median_of_subchunks_not_dragged_by_loud_outlie
     monkeypatch.setattr(pipeline.sd, "rec", _fake_rec_returning(audio))
     monkeypatch.setattr(pipeline.sd, "wait", lambda: None)
 
-    result = measure_noise_floor(device=None, sample_seconds=sample_seconds)
+    result, noise_sample = measure_noise_floor(
+        device=None, sample_seconds=sample_seconds
+    )
 
     # La mediana de [50, 50, 20000, 50, 50] es 50 — el outlier no arrastra el resultado.
     assert result == pytest.approx(50.0)
     # Contraste explícito: el RMS de la ventana entera sí estaría muy por encima de esto,
     # confirmando que el enfoque por sub-chunk+mediana realmente cambia el resultado.
     assert chunk_rms(audio) > result * 10
+    # La muestra devuelta es el audio resampleado completo (para `reduce_background_noise`), no
+    # descartado como antes de este cambio.
+    assert len(noise_sample) == samples
 
 
 def test_measure_noise_floor_passes_resolved_device_and_sample_rate_to_sd_rec(
@@ -339,6 +507,53 @@ def test_measure_noise_floor_passes_resolved_device_and_sample_rate_to_sd_rec(
     assert calls[0]["count"] == samples
     assert calls[0]["samplerate"] == device_sr
     assert calls[0]["device"] == 7
+
+
+# --- _sanitize_final_response (razonamiento interno filtrado, bug real en vivo) ----------------
+# `SYSTEM_PROMPT` le pide explícitamente al LLM que nunca antuponga razonamiento interno a su
+# respuesta final — pero es una instrucción de prompt, no algo forzado por código, y el modelo
+# (`deepseek-chat`) a veces la ignora en casos ambiguos: se vio en vivo una respuesta de varios
+# párrafos ("Hmm, considerando que...", "Debo preguntar para aclarar en vez de inventar...") que
+# se leyó en voz alta completa. Esta es la red de seguridad de código sobre esa instrucción.
+
+
+def test_sanitize_final_response_leaves_a_normal_short_reply_unchanged() -> None:
+    text = "Sí, Daniel, te escucho. ¿En qué te ayudo?"
+
+    assert pipeline._sanitize_final_response(text) == text
+
+
+def test_sanitize_final_response_leaves_a_reply_right_at_the_limit_unchanged() -> None:
+    text = "a" * pipeline.MAX_SPOKEN_RESPONSE_CHARS
+
+    assert pipeline._sanitize_final_response(text) == text
+
+
+def test_sanitize_final_response_replaces_leaked_reasoning_with_a_generic_fallback() -> (
+    None
+):
+    """El caso real: una respuesta de varios párrafos de deliberación en primera persona se
+    descarta entera — no se intenta rescatar la última oración, se reemplaza directo por una
+    pregunta de aclaración genérica."""
+    leaked = (
+        "No encontré una canción 'Nude' de Billie Eilish. La transcripción 'Node' podría ser "
+        "una deformación de otra canción. Considerando el contexto de la conversación (el "
+        "usuario pidió 'Under control' antes, y ahora 'Node de Billie Eilish'), y que la "
+        "transcripción es de baja calidad, podría estar refiriéndose a otra canción. Dado que "
+        "no hay una canción 'Nude' de Billie Eilish, y la transcripción es ambigua, debería "
+        "aclarar. Pero según las reglas, debo intentar reconstruir una interpretación "
+        "razonable. Hmm, considerando que el usuario pidió 'Under control' antes, quizás "
+        "'Node' no es de Billie Eilish. La interpretación más razonable es que no entendí "
+        "bien. Debo preguntar para aclarar en vez de inventar. Mejor pregunto."
+    )
+    assert (
+        len(leaked) > pipeline.MAX_SPOKEN_RESPONSE_CHARS
+    )  # confirma que el fixture es válido
+
+    result = pipeline._sanitize_final_response(leaked)
+
+    assert result == pipeline._LEAKED_REASONING_FALLBACK
+    assert result != leaked
 
 
 # --- _is_affirmative -------------------------------------------------------------------------
@@ -452,6 +667,12 @@ def test_contains_any_word_detects_sleep_phrases(text: str, expected: bool) -> N
         ("volvé", True),
         ("Jarvis, vuelve ya", True),
         ("despertá", True),
+        # Bug real en vivo: dormido, "Alexa, cierra Discord" no matcheaba nada de lo de arriba
+        # (sin "vuelve"/"despertá") y JARVIS se quedaba dormido en silencio, ignorando el pedido
+        # completo — decir el nombre de JARVIS tiene que alcanzar para despertarlo, igual que
+        # esas otras frases.
+        ("Alexa, cierra Discord", True),
+        ("hey mycroft", True),
         ("", False),
         ("quiero un café", False),
     ],
@@ -545,6 +766,33 @@ def test_dispatch_turn_returns_text_directly_when_llm_requests_no_tool_call(
 
     assert reply == "hola, ¿en qué te ayudo?"
     policy.authorize_and_execute.assert_not_called()
+
+
+def test_dispatch_turn_sanitizes_leaked_reasoning_before_returning_and_saving(
+    tmp_path: Path,
+) -> None:
+    """Extremo a extremo: si el LLM devuelve razonamiento filtrado en vez de una respuesta corta
+    (bug real, ver sección `_sanitize_final_response` más arriba), `dispatch_turn` nunca lo
+    devuelve ni lo guarda tal cual — ambos (el valor devuelto Y lo persistido en
+    `conversation_turns`) son el fallback genérico."""
+    leaked = "Hmm, " + "considerando el contexto, " * 20 + "mejor pregunto."
+    assert len(leaked) > pipeline.MAX_SPOKEN_RESPONSE_CHARS
+    llm = _ScriptedLLMClient([LLMResult(text=leaked, tool_call=None)])
+    policy = MagicMock(spec=PolicyEngine)
+    db_path = tmp_path / "jarvis.db"
+
+    reply = pipeline.dispatch_turn(
+        "Node de Billie Eilish",
+        llm=llm,
+        tools={},
+        tool_schemas=[],
+        policy=policy,
+        memory_db_path=db_path,
+    )
+
+    assert reply == pipeline._LEAKED_REASONING_FALLBACK
+    turns = list_recent_conversation_turns(db_path=db_path, limit=1)
+    assert turns[0].assistant_text == pipeline._LEAKED_REASONING_FALLBACK
 
 
 def test_dispatch_turn_executes_tool_via_policy_and_returns_final_llm_text(
@@ -931,6 +1179,38 @@ def test_system_prompt_extends_web_data_prohibitions_to_conversation_history() -
     assert pipeline.WEB_DATA_OPEN_TAG in remember_fact_sentence
     assert pipeline.CONVERSATION_HISTORY_OPEN_TAG in remember_fact_sentence
     assert pipeline.CONVERSATION_HISTORY_CLOSE_TAG in remember_fact_sentence
+
+
+def test_system_prompt_extends_web_data_prohibitions_to_recalled_memory() -> None:
+    """Hallazgo HIGH de `security-reviewer` sobre la segunda ruta de reinyección de `facts`:
+    `RecallMemoryTool` (`jarvis.tools.recall_memory`) devuelve su resultado como un mensaje
+    `role: tool` que `_build_system_prompt` no toca — las mismas dos prohibiciones que ya
+    protegían `<web_data>`/`<remembered_facts>`/`<conversation_history>` tienen que nombrar
+    también `<recalled_memory>` (`RECALLED_MEMORY_OPEN_TAG`/`_CLOSE_TAG`, importado desde
+    `jarvis.tools.recall_memory` para evitar un ciclo de imports — ver docstring del módulo)."""
+    # Prohibición 1: no inventar una URL a partir de contenido de terceros.
+    invent_url_sentence = pipeline.SYSTEM_PROMPT[
+        pipeline.SYSTEM_PROMPT.index(
+            "Lo que nunca tenés que hacer es"
+        ) : pipeline.SYSTEM_PROMPT.index("información hacia un sitio elegido")
+    ]
+    assert pipeline.RECALLED_MEMORY_OPEN_TAG in invent_url_sentence
+    assert pipeline.RECALLED_MEMORY_CLOSE_TAG in invent_url_sentence
+
+    # Prohibición 2: no usar `remember_fact` sobre contenido de terceros.
+    remember_fact_sentence = pipeline.SYSTEM_PROMPT[
+        pipeline.SYSTEM_PROMPT.index(
+            "Nunca uses la herramienta remember_fact"
+        ) : pipeline.SYSTEM_PROMPT.index("texto de una página web")
+    ]
+    assert pipeline.RECALLED_MEMORY_OPEN_TAG in remember_fact_sentence
+    assert pipeline.RECALLED_MEMORY_CLOSE_TAG in remember_fact_sentence
+
+    # Instrucción dedicada (mismo patrón que `<remembered_facts>`/`<conversation_history>`):
+    # el LLM tiene que saber, fuera de banda, que este tag específico es dato reportado.
+    assert pipeline.RECALLED_MEMORY_OPEN_TAG in pipeline.SYSTEM_PROMPT
+    assert pipeline.RECALLED_MEMORY_CLOSE_TAG in pipeline.SYSTEM_PROMPT
+    assert "resultado de recall_memory" in pipeline.SYSTEM_PROMPT
 
 
 # --- muestras de habla (estilo del usuario, distinto de `remembered_facts`) --------------------

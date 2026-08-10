@@ -119,6 +119,10 @@ def _list_running_process_names() -> list[str]:
             capture_output=True,
             text=True,
             check=False,
+            # Sin esto, Windows abre una ventana de consola visible para `tasklist.exe` cada vez
+            # — JARVIS corre vía `pythonw.exe`, sin consola propia a la que adjuntarlo (bug real
+            # encontrado en vivo con el mismo patrón en `jarvis.league.lcu_monitor`).
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except OSError:
         logger.warning("No se pudo ejecutar tasklist para listar procesos.")
@@ -202,6 +206,7 @@ def _terminate_process(image_name: str) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except OSError as exc:
         return False, f"No pude cerrar {display_name} ({exc.__class__.__name__})."
