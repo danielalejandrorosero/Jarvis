@@ -143,10 +143,9 @@ def test_execute_rejects_blank_target_without_cancelling_anything() -> None:
     assert scheduler.pending_timer_count == 1
 
 
-def test_cancel_all_timers_tool_declares_confirm_risk() -> None:
-    """ADR-0006: borrar TODO lo pendiente de una sola frase, sin oportunidad de decir que no,
-    cruza a CONFIRM — ver docstring del módulo."""
-    assert CancelAllTimersTool.risk is RiskLevel.CONFIRM
+def test_cancel_all_timers_tool_declares_safe_risk() -> None:
+    """Downgrade deliberado pedido explícitamente por el usuario — ver close_app.py."""
+    assert CancelAllTimersTool.risk is RiskLevel.SAFE
 
 
 def test_cancel_all_timers_execute_cancels_every_pending_timer() -> None:

@@ -46,8 +46,9 @@ def test_start_queue_tool_declares_safe_risk() -> None:
     assert StartQueueTool.risk is RiskLevel.SAFE
 
 
-def test_set_lobby_queue_tool_declares_confirm_risk() -> None:
-    assert SetLobbyQueueTool.risk is RiskLevel.CONFIRM
+def test_set_lobby_queue_tool_declares_safe_risk() -> None:
+    """Downgrade deliberado pedido explícitamente por el usuario — ver close_app.py."""
+    assert SetLobbyQueueTool.risk is RiskLevel.SAFE
 
 
 def test_cancel_queue_tool_declares_safe_risk() -> None:

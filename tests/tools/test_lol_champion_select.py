@@ -108,8 +108,9 @@ def test_preview_champion_tool_declares_safe_risk() -> None:
     assert PreviewChampionTool.risk is RiskLevel.SAFE
 
 
-def test_lock_champion_tool_declares_confirm_risk() -> None:
-    assert LockChampionTool.risk is RiskLevel.CONFIRM
+def test_lock_champion_tool_declares_safe_risk() -> None:
+    """Downgrade deliberado pedido explícitamente por el usuario — ver close_app.py."""
+    assert LockChampionTool.risk is RiskLevel.SAFE
 
 
 def test_preview_and_lock_tools_have_distinct_names() -> None:

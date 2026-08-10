@@ -244,7 +244,10 @@ class CancelAllRemindersTool(Tool):
         "properties": {},
         "additionalProperties": False,
     }
-    risk = RiskLevel.CONFIRM
+    # Pedido explícito del usuario: sacar todos los confirmadores salvo SystemPowerTool (ver
+    # close_app.py para el motivo completo — confirmación hablada rota en la práctica por
+    # audio de juego durante la ventana de escucha). Downgrade deliberado a SAFE.
+    risk = RiskLevel.SAFE
 
     def __init__(self, *, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         self._db_path = db_path

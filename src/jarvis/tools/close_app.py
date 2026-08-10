@@ -248,7 +248,12 @@ class CloseAppTool(Tool):
         "required": ["app_name"],
         "additionalProperties": False,
     }
-    risk = RiskLevel.CONFIRM
+    # Pedido explícito del usuario (en vivo, con "Kimi" citado como alternativa si no se
+    # sacaba): la confirmación hablada se rompía en la práctica por contaminación de audio
+    # del juego durante la ventana de escucha de la respuesta, y el usuario prefirió sacar la
+    # fricción de raíz antes que esperar el fix del pipeline de audio. Downgrade deliberado a
+    # SAFE, no un bug — único CONFIRM que sigue en pie en todo el repo es SystemPowerTool.
+    risk = RiskLevel.SAFE
 
     def describe(self, kwargs: dict[str, Any]) -> str:
         """Frase natural para el prompt de confirmación por voz de `PolicyEngine`

@@ -128,10 +128,9 @@ def test_execute_rejects_blank_target_without_touching_the_store(
     assert len(list_reminders(db_path=db_path)) == 1
 
 
-def test_cancel_all_reminders_tool_declares_confirm_risk() -> None:
-    """ADR-0006 y `.claude/rules/security.md` (excepción SAFE del store propio de JARVIS no
-    cubre borrado masivo) — ver docstring del módulo."""
-    assert CancelAllRemindersTool.risk is RiskLevel.CONFIRM
+def test_cancel_all_reminders_tool_declares_safe_risk() -> None:
+    """Downgrade deliberado pedido explícitamente por el usuario — ver close_app.py."""
+    assert CancelAllRemindersTool.risk is RiskLevel.SAFE
 
 
 def test_cancel_all_reminders_execute_cancels_every_pending_reminder(

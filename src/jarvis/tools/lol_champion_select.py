@@ -434,7 +434,11 @@ class LockChampionTool(Tool):
         "required": ["champion_name"],
         "additionalProperties": False,
     }
-    risk = RiskLevel.CONFIRM
+    # Pedido explícito del usuario: sacar todos los confirmadores salvo SystemPowerTool (ver
+    # close_app.py para el motivo completo — confirmación hablada rota en la práctica por
+    # audio de juego durante la ventana de escucha). Downgrade deliberado a SAFE: lockear el
+    # campeón equivocado ya no tiene red de seguridad hablada.
+    risk = RiskLevel.SAFE
 
     def describe(self, kwargs: dict[str, Any]) -> str:
         """Ver `_describe_lock_target` para el razonamiento completo (por qué resuelve el

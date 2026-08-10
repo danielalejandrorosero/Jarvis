@@ -411,7 +411,11 @@ class SetLobbyQueueTool(Tool):
         "required": ["queue_type"],
         "additionalProperties": False,
     }
-    risk = RiskLevel.CONFIRM
+    # Pedido explícito del usuario: sacar todos los confirmadores salvo SystemPowerTool (ver
+    # close_app.py para el motivo completo — confirmación hablada rota en la práctica por
+    # audio de juego durante la ventana de escucha, exactamente el caso real que motivó el
+    # pedido). Downgrade deliberado a SAFE: puede reemplazar un lobby ya armado sin avisar.
+    risk = RiskLevel.SAFE
 
     def describe(self, kwargs: dict[str, Any]) -> str:
         """Frase natural para el prompt de confirmación por voz de `PolicyEngine`

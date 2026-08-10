@@ -48,10 +48,11 @@ def _install_fake_terminate(
     return calls
 
 
-def test_close_app_tool_declares_confirm_risk() -> None:
-    """ "Terminar procesos" está listado explícitamente como ejemplo CONFIRM en
-    `.claude/rules/security.md` — nunca SAFE, nunca DANGEROUS."""
-    assert CloseAppTool.risk is RiskLevel.CONFIRM
+def test_close_app_tool_declares_safe_risk() -> None:
+    """Downgrade deliberado pedido explícitamente por el usuario (confirmación hablada rota en
+    la práctica por audio de juego durante la ventana de escucha) — único CONFIRM que queda en
+    el repo es SystemPowerTool."""
+    assert CloseAppTool.risk is RiskLevel.SAFE
 
 
 def test_describe_names_the_resolved_process_not_the_raw_app_name(

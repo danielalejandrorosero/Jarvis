@@ -254,7 +254,10 @@ class CancelAllTimersTool(Tool):
         "properties": {},
         "additionalProperties": False,
     }
-    risk = RiskLevel.CONFIRM
+    # Pedido explícito del usuario: sacar todos los confirmadores salvo SystemPowerTool (ver
+    # close_app.py para el motivo completo — confirmación hablada rota en la práctica por
+    # audio de juego durante la ventana de escucha). Downgrade deliberado a SAFE.
+    risk = RiskLevel.SAFE
 
     def __init__(self, *, scheduler: TimerScheduler) -> None:
         # Misma instancia compartida que `TimerTool`/`CancelTimerTool` — nunca una propia.
