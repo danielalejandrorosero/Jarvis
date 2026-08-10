@@ -236,19 +236,72 @@ AGC_TARGET_PEAK_RATIO = 0.9  # a qué % del rango de int16 apuntamos al subir vo
 CHUNK_SECONDS = (
     0.2  # tamaño de chunk para detectar silencio mientras se graba el comando
 )
-NOISE_FLOOR_SAMPLE_SECONDS = 1.5  # cuánto se mide de ambiente al arrancar para calibrar
+NOISE_FLOOR_SAMPLE_SECONDS = 3.0  # cuánto se mide de ambiente al arrancar para calibrar
+# Antes en 1.5 — bug real, en vivo, confirmado con `data/jarvis-error.log` en dos reinicios
+# consecutivos del mismo proceso, mismo usuario, misma sala, mismo juego (League of Legends)
+# sonando: una corrida calibró `umbral=4621.7` (piso de ruido 1155.4) y la siguiente, minutos
+# después, sin ningún cambio real de ambiente, calibró `umbral=74.1` (piso de ruido 18.5) — una
+# diferencia de 62x en el umbral calibrado entre dos corridas consecutivas. Causa: el audio de
+# juego/música es "bursty" (silencio entre efectos de sonido, fuerte durante ellos, no ruido
+# estacionario) — con una ventana de apenas 1.5s, una sola racha de suerte de silencio entre
+# efectos podía dejar la ventana entera (o casi) sin ningún sub-chunk representativo del nivel
+# típico real, y ese piso de ruido anormalmente bajo quedaba fijo para toda la sesión (nunca se
+# recalibra después del arranque). Duplicar la ventana a 3.0s reduce la probabilidad de que la
+# calibración entera caiga en un hueco de silencio sin cruzarse con ningún efecto de sonido —
+# sigue siendo una ventana corta (no un cambio de arquitectura, ver `NOISE_FLOOR_PERCENTILE` más
+# abajo para la otra mitad del fix), pero el doble de muestra ya reduce bastante el riesgo de mala
+# suerte sin alargar mucho el arranque (sigue siendo un par de segundos, no algo perceptible como
+# una demora real).
 NOISE_FLOOR_SUBCHUNKS = (
-    5  # partir la medición en sub-chunks y usar la mediana del RMS, no el
+    10  # partir la medición en sub-chunks y usar un percentil alto del RMS
 )
-# RMS de la ventana entera. Confirmado en vivo: un ruido puntual justo al arrancar la
-# calibración (el usuario todavía terminando de hablar, un clic, etc.) infla el RMS de toda la
-# ventana y el umbral de silencio queda desproporcionado (llegó a calibrar en 17752, casi la
-# mitad del rango de int16) — la mediana ignora ese pico puntual mientras siga siendo un solo
-# sub-chunk de varios.
+# (`NOISE_FLOOR_PERCENTILE`) de esos sub-chunks, no la mediana ni el RMS de la ventana entera.
+# Duplicado de 5 a 10 junto con `NOISE_FLOOR_SAMPLE_SECONDS` (1.5s→3.0s) para mantener el mismo
+# tamaño de sub-chunk (~0.3s) que ya funcionaba bien contra el caso que motivó el sub-chunkeo en
+# primer lugar (ver `NOISE_FLOOR_PERCENTILE`): un ruido puntual justo al arrancar la calibración
+# (el usuario todavía terminando de hablar, un clic, etc.) infla el RMS de toda la ventana y el
+# umbral de silencio queda desproporcionado (llegó a calibrar en 17752, casi la mitad del rango de
+# int16) — sub-chunks de ~0.3s siguen acotando cuánto puede pesar un solo pico aislado sobre el
+# estadístico final, con el doble de resolución para el percentil de abajo.
+NOISE_FLOOR_PERCENTILE = 75.0  # percentil (no la mediana) del RMS por sub-chunk usado
+# para calibrar. Antes se usaba `np.median` (percentil 50): correcto contra UN sub-chunk aislado
+# ruidoso (un clic, ver arriba), pero es exactamente el estadístico equivocado contra ruido
+# "bursty" con más de un sub-chunk quieto que ruidoso en la ventana — la mediana termina
+# reportando "el momento típico" (a menudo un hueco de silencio entre efectos), no "el nivel típico
+# cuando el ambiente realmente está sonando", que es lo que hace falta para no mezclar audio de
+# juego con habla real el resto de la sesión. Percentil 75 (no 50) sigue ignorando un outlier
+# aislado hacia arriba (con `NOISE_FLOOR_SUBCHUNKS=10`, un solo sub-chunk ruidoso entre 9 quietos
+# queda muy por debajo del percentil 75 — mismo caso cubierto arriba), pero ante una mezcla real de
+# sub-chunks quietos/ruidosos (el caso "bursty" que motiva este cambio) el resultado se inclina
+# hacia los momentos más fuertes de la ventana en vez de ignorarlos como si fueran outliers. No se
+# eligió un percentil más alto (90/95) a propósito: correría el riesgo inverso, que un pico real
+# aislado (no representativo del nivel típico "fuerte") termine dominando el piso calibrado —
+# 75 es el punto medio razonado entre "ignorar por completo los momentos fuertes" (mediana) y
+# "que un solo pico los defina" (percentil muy alto/máximo), sin datos en vivo de sesiones bursty
+# reales para afinarlo más — revisar si en uso real todavía se ven picos aislados de calibración
+# desproporcionados.
 NOISE_FLOOR_MULTIPLIER = (
     4.0  # el umbral de silencio/voz se calibra a piso_de_ruido * esto
 )
-MIN_SILENCE_RMS_THRESHOLD = 40.0  # piso absoluto — nunca calibrar más sensible que esto
+MIN_SILENCE_RMS_THRESHOLD = (
+    150.0  # piso absoluto — nunca calibrar más sensible que esto
+)
+# Antes en 40.0 — demostrado insuficiente en vivo (ver `NOISE_FLOOR_SAMPLE_SECONDS`): con un piso
+# de ruido mal medido de 18.5, el viejo mínimo de 40 ni siquiera llegaba a activarse (18.5 * 4.0 =
+# 74.0 > 40), así que el umbral calibrado terminó en 74.1 — muy por debajo de lo que hace falta
+# para no confundir audio de juego/música con habla real (la misma sesión, con una medición de
+# suerte, había calibrado en 4621.7 minutos antes). 150.0 es una decisión razonada, no verificada
+# en vivo contra el escenario exacto "sala en silencio, sin juego ni música" de este usuario (no se
+# pudo forzar ese escenario en el momento de este fix): en esta misma sesión, el ambiente sin habla
+# real medía RMS ~0.3-20 (silencio digital real, ver `chunk rms=0.3`/`rms=18.5` en
+# `jarvis-error.log`) y la voz real del usuario, ya con el mic array del laptop (lejos de la boca,
+# no un headset), midió mayormente RMS 300-9000 con picos frecuentes en el rango de miles — 150.0
+# queda muy por encima del piso de silencio digital real observado (margen de ~7x-500x) y bastante
+# por debajo del rango típico de habla real observado, así que no debería recortar habla suave
+# genuina, pero es sustancialmente más alto que el 40.0 anterior, que la propia matemática de este
+# incidente mostró que no alcanza como piso de seguridad. Marcar para revisión si en uso real
+# (sala realmente silenciosa, sin juego/música) este piso resulta ser sistemáticamente demasiado
+# alto o demasiado bajo — no se pudo verificar en vivo contra ese escenario específico esta noche.
 # Resta espectral (ver `reduce_background_noise`): tamaño de ventana/hop en samples a 16kHz
 # (64ms/16ms, 75% overlap — estándar para voz) y cuánto perfil de ruido restar de cada frame.
 NOISE_REDUCTION_FRAME_SAMPLES = 1024
@@ -643,10 +696,18 @@ def measure_noise_floor(
 ) -> tuple[float, np.ndarray]:
     """Medir el RMS del ambiente al arrancar, para calibrar los umbrales de silencio/voz contra
     las condiciones reales del momento (distancia al mic, ruido de fondo) en vez de un número
-    fijo para siempre. Asume que en ese primer segundo nadie está hablando todavía — es el
+    fijo para siempre. Asume que en esos primeros segundos nadie está hablando todavía — es el
     enfoque de "umbral adaptativo" que usan los sistemas de producción, frente al umbral
     estático que veníamos usando (confirmado en vivo: la señal real varía muchísimo según
     dónde esté el usuario, no solo según su voz).
+
+    El estadístico usado sobre los sub-chunks es `NOISE_FLOOR_PERCENTILE` (percentil 75, no la
+    mediana) — ver el comentario de esa constante para el bug real que motiva el cambio: ante
+    ruido "bursty" (audio de juego/música, silencio entre efectos y fuerte durante ellos), la
+    mediana de una ventana corta puede caer entera en un hueco de silencio y calibrar un umbral
+    de voz muchísimo más sensible de lo que el ambiente real amerita, sin ningún cambio real de
+    condiciones entre una corrida y la siguiente (confirmado en vivo, 62x de diferencia entre dos
+    reinicios consecutivos del mismo proceso).
 
     Devuelve `(rms, muestra_resampleada_a_16khz)` — antes solo devolvía el RMS y descartaba el
     audio. Ese mismo audio de "ambiente sin hablar" es exactamente el perfil de ruido que
@@ -664,7 +725,11 @@ def measure_noise_floor(
         np.asarray(audio.reshape(-1)), orig_sr=device_sr, target_sr=SAMPLE_RATE
     )
     subchunks = np.array_split(resampled, NOISE_FLOOR_SUBCHUNKS)
-    return float(np.median([chunk_rms(chunk) for chunk in subchunks])), resampled
+    subchunk_rms_values = [chunk_rms(chunk) for chunk in subchunks]
+    return (
+        float(np.percentile(subchunk_rms_values, NOISE_FLOOR_PERCENTILE)),
+        resampled,
+    )
 
 
 def calibrate_thresholds(noise_floor: float) -> float:

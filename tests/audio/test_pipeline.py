@@ -30,6 +30,7 @@ from jarvis.audio import pipeline
 from jarvis.audio.pipeline import (
     MIN_SILENCE_RMS_THRESHOLD,
     NOISE_FLOOR_MULTIPLIER,
+    NOISE_FLOOR_PERCENTILE,
     NOISE_FLOOR_SUBCHUNKS,
     NOISE_REDUCTION_FRAME_SAMPLES,
     SAMPLE_RATE,
@@ -88,7 +89,7 @@ def test_calibrate_thresholds_floor_wins_when_noise_floor_is_low() -> None:
     """Con un ambiente muy silencioso, el piso absoluto (`MIN_SILENCE_RMS_THRESHOLD`) gana
     sobre el múltiplo del piso de ruido — nunca se calibra por debajo de ese mínimo."""
     noise_floor = (
-        5.0  # 5 * NOISE_FLOOR_MULTIPLIER (4.0) == 20, por debajo del piso de 40
+        5.0  # 5 * NOISE_FLOOR_MULTIPLIER (4.0) == 20, por debajo del piso de 150
     )
 
     result = calibrate_thresholds(noise_floor)
@@ -100,7 +101,7 @@ def test_calibrate_thresholds_multiplier_wins_when_noise_floor_is_high() -> None
     """Con un ambiente ruidoso, el umbral escala con el piso de ruido medido, no se queda
     pegado al mínimo absoluto."""
     noise_floor = (
-        20.0  # 20 * NOISE_FLOOR_MULTIPLIER (4.0) == 80, por encima del piso de 40
+        100.0  # 100 * NOISE_FLOOR_MULTIPLIER (4.0) == 400, por encima del piso de 150
     )
 
     result = calibrate_thresholds(noise_floor)
@@ -444,12 +445,15 @@ def _fake_rec_returning(audio: np.ndarray) -> object:
     return _rec
 
 
-def test_measure_noise_floor_uses_median_of_subchunks_not_dragged_by_loud_outlier(
+def test_measure_noise_floor_ignores_a_single_isolated_loud_subchunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regresión (el motivo de este cambio, ver docstring del módulo): un único sub-chunk
-    ruidoso en medio de la ventana medida no debe inflar el piso de ruido reportado — la
-    mediana de los RMS por sub-chunk lo ignora mientras siga siendo un outlier aislado."""
+    """Regresión (el motivo original del sub-chunkeo, ver comentario de `NOISE_FLOOR_SUBCHUNKS`):
+    un único sub-chunk ruidoso (ej. un clic, el usuario terminando de hablar justo al arrancar la
+    calibración) en medio de una ventana mayormente silenciosa no debe inflar el piso de ruido
+    reportado — con `NOISE_FLOOR_SUBCHUNKS=10` sub-chunks y 1 solo ruidoso (10% de la ventana),
+    el percentil 75 (`NOISE_FLOOR_PERCENTILE`) todavía cae del lado silencioso, igual que antes
+    lo hacía la mediana."""
     device_sr = SAMPLE_RATE  # evita que `resample()` interpole (orig_sr == target_sr)
     sample_seconds = 1.0
     samples = int(sample_seconds * device_sr)
@@ -458,8 +462,11 @@ def test_measure_noise_floor_uses_median_of_subchunks_not_dragged_by_loud_outlie
 
     quiet = np.full(subchunk_len, 50, dtype=np.int16)
     loud = np.full(subchunk_len, 20000, dtype=np.int16)
-    # Un solo sub-chunk (el del medio) ruidoso, el resto silencioso.
-    audio = np.concatenate([quiet, quiet, loud, quiet, quiet])
+    # Un solo sub-chunk ruidoso (el del medio), el resto silencioso.
+    half = NOISE_FLOOR_SUBCHUNKS // 2
+    audio = np.concatenate(
+        [quiet] * half + [loud] + [quiet] * (NOISE_FLOOR_SUBCHUNKS - half - 1)
+    )
     assert len(audio) == samples
 
     monkeypatch.setattr(pipeline, "resolve_input_device", lambda device: 0)
@@ -471,14 +478,69 @@ def test_measure_noise_floor_uses_median_of_subchunks_not_dragged_by_loud_outlie
         device=None, sample_seconds=sample_seconds
     )
 
-    # La mediana de [50, 50, 20000, 50, 50] es 50 — el outlier no arrastra el resultado.
+    # El percentil 75 de 9 sub-chunks a 50 y 1 a 20000 sigue del lado silencioso — el outlier
+    # aislado no arrastra el resultado.
     assert result == pytest.approx(50.0)
     # Contraste explícito: el RMS de la ventana entera sí estaría muy por encima de esto,
-    # confirmando que el enfoque por sub-chunk+mediana realmente cambia el resultado.
+    # confirmando que el enfoque por sub-chunk+percentil realmente cambia el resultado.
     assert chunk_rms(audio) > result * 10
     # La muestra devuelta es el audio resampleado completo (para `reduce_background_noise`), no
     # descartado como antes de este cambio.
     assert len(noise_sample) == samples
+
+
+def test_measure_noise_floor_bursty_noise_does_not_collapse_to_the_quiet_gaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regresión directa del bug real, en vivo (ver `NOISE_FLOOR_SAMPLE_SECONDS`): audio de
+    juego/música "bursty" — silencio entre efectos, fuerte durante ellos — donde la MAYORÍA de
+    los sub-chunks son silenciosos pero una fracción real (no un solo outlier aislado) es
+    ruidosa. Con la mediana (percentil 50, el comportamiento anterior a este fix) el resultado
+    se queda pegado al lado silencioso pese a que el ambiente real, cuando suena, es mucho más
+    fuerte — exactamente el mecanismo que calibró `umbral=74.1` en vez de algo cercano a los
+    `4621.7` de una corrida "con suerte" minutos antes, en la misma sesión real. El percentil 75
+    debe inclinarse hacia el nivel fuerte en vez de colapsar al nivel silencioso."""
+    device_sr = SAMPLE_RATE  # evita que `resample()` interpole (orig_sr == target_sr)
+    sample_seconds = 1.0
+    samples = int(sample_seconds * device_sr)
+    subchunk_len = samples // NOISE_FLOOR_SUBCHUNKS
+    assert samples % NOISE_FLOOR_SUBCHUNKS == 0  # asegura splits parejos para el test
+    assert NOISE_FLOOR_SUBCHUNKS == 10  # el patrón de abajo asume 10 sub-chunks exactos
+    assert (
+        NOISE_FLOOR_PERCENTILE == 75.0
+    )  # el cálculo de arriba (posición 6.75) lo asume
+
+    quiet = np.full(subchunk_len, 50, dtype=np.int16)
+    loud = np.full(subchunk_len, 2000, dtype=np.int16)
+    # 7 sub-chunks silenciosos, 3 ruidosos (mayoría silenciosa, pero una fracción real de
+    # ráfagas ruidosas — no un solo outlier aislado como en el test de arriba), intercalados
+    # para no depender de en qué posición exacta caiga el percentil.
+    audio = np.concatenate(
+        [quiet, loud, quiet, quiet, loud, quiet, quiet, loud, quiet, quiet]
+    )
+    assert len(audio) == samples
+
+    monkeypatch.setattr(pipeline, "resolve_input_device", lambda device: 0)
+    monkeypatch.setattr(pipeline, "input_sample_rate", lambda device: device_sr)
+    monkeypatch.setattr(pipeline.sd, "rec", _fake_rec_returning(audio))
+    monkeypatch.setattr(pipeline.sd, "wait", lambda: None)
+
+    result, _noise_sample = measure_noise_floor(
+        device=None, sample_seconds=sample_seconds
+    )
+
+    # La mediana (percentil 50) de esta misma distribución de 10 sub-chunks (7 silenciosos, 3
+    # ruidosos) es exactamente el nivel silencioso — con mayoría absoluta de sub-chunks
+    # silenciosos, el 5to/6to valor ordenado siguen siendo silenciosos. Ese colapso al nivel
+    # silencioso es el bug real que este fix corrige; el percentil 75 debe quedar bien por
+    # encima, reflejando que el ambiente real incluye ráfagas fuertes.
+    subchunk_rms_values = sorted([chunk_rms(quiet)] * 7 + [chunk_rms(loud)] * 3)
+    median_equivalent = float(np.median(subchunk_rms_values))
+    assert median_equivalent == pytest.approx(chunk_rms(quiet))
+    assert result > median_equivalent + 500.0
+    # Con el umbral calibrado a partir de esto (`calibrate_thresholds`), la sesión no debe volver
+    # a colapsar a un umbral tan sensible como el 74.1 observado en vivo.
+    assert calibrate_thresholds(result) > 500.0
 
 
 def test_measure_noise_floor_passes_resolved_device_and_sample_rate_to_sd_rec(
