@@ -32,13 +32,14 @@ repositorio — este README las resume y las aplica en el código real, no las r
 2. [El contrato `Tool` / `RiskLevel` / `PolicyEngine`](#el-contrato-tool--risklevel--policyengine)
 3. [Inventario completo de tools](#inventario-completo-de-tools)
 4. [Pipeline de voz](#pipeline-de-voz)
-5. [Memoria persistente](#memoria-persistente)
-6. [Integración con League of Legends](#integración-con-league-of-legends)
-7. [Stack y dependencias](#stack-y-dependencias)
-8. [Estructura del repositorio](#estructura-del-repositorio)
-9. [Workflow de desarrollo](#workflow-de-desarrollo)
-10. [Limitaciones conocidas / riesgos abiertos](#limitaciones-conocidas--riesgos-abiertos)
-11. [Dónde seguir leyendo](#dónde-seguir-leyendo)
+5. [Overlay flotante de estado](#overlay-flotante-de-estado)
+6. [Memoria persistente](#memoria-persistente)
+7. [Integración con League of Legends](#integración-con-league-of-legends)
+8. [Stack y dependencias](#stack-y-dependencias)
+9. [Estructura del repositorio](#estructura-del-repositorio)
+10. [Workflow de desarrollo](#workflow-de-desarrollo)
+11. [Limitaciones conocidas / riesgos abiertos](#limitaciones-conocidas--riesgos-abiertos)
+12. [Dónde seguir leyendo](#dónde-seguir-leyendo)
 
 ## Arquitectura: trace de una acción real
 
@@ -276,6 +277,43 @@ Loop principal en `pipeline.run()` (`src/jarvis/audio/pipeline.py`):
    `utf-8`/`errors="replace"` al arrancar por el mismo motivo (arranque automático vía
    `pythonw.exe`, sin consola, usa cp1252 por default en Windows).
 
+## Overlay flotante de estado
+
+Primera interfaz visual del proyecto (ADR-0008) — hasta esta fase JARVIS era puramente background,
+sin ningún rastro más allá de voz y `data/jarvis.log`. `jarvis.ui.overlay` es una ventanita
+flotante, sin bordes, siempre encima, en la esquina inferior derecha de la pantalla, que muestra
+en vivo si Alexa está esperando la wake word, escuchando un comando, pensando (esperando al
+LLM/tools) o hablando, más lo último dicho (comando del usuario o respuesta de JARVIS, truncado a
+una línea). Corre como **proceso separado** de `jarvis.audio.pipeline.run()` — nunca comparte
+intérprete ni loop de eventos con el pipeline de voz (`asyncio` vs. el `mainloop()` bloqueante de
+Tk) — así que matar o reiniciar cualquiera de los dos nunca afecta al otro.
+
+Comunicación entre ambos procesos: un archivo JSON plano, `data/status.json`
+(`jarvis.ui.status.write_status`/`read_status`), que `run()` escribe en cada transición de estado
+real y que el overlay sondea cada ~200ms vía `Tk.after()`. Un `StatusHeartbeat` de fondo
+(`jarvis.ui.status`, mismo patrón `start()`/`stop()` que `SystemAudioMonitor`/
+`LCUAutoAcceptMonitor`/`TimerScheduler`) reescribe el último estado conocido cada 2s aunque no haya
+ninguna transición nueva — necesario porque `run()` puede pasar minutos bloqueado esperando la
+wake word sin ningún evento real de por medio. Si el archivo no existe o quedó más viejo que 5s, el
+overlay se muestra como "sin conexión" en vez de mostrar un estado desactualizado como si fuera en
+vivo. Ninguna escritura de estado puede tumbar un turno de voz real (`write_status` nunca lanza,
+misma frontera de recuperación que el resto de `run()`) y el pipeline nunca depende de que el
+overlay exista — degradación en ambas direcciones, ver ADR-0008 para el detalle completo.
+
+`GUI: tkinter` (stdlib, sin dependencia nueva) — ventana frameless (`overrideredirect`),
+always-on-top (`-topmost`), semi-transparente (`-alpha`) y oculta de la barra de tareas
+(`-toolwindow`), sin robar foco a la ventana activa (pedido explícito: no debe interrumpir mientras
+se juega).
+
+**Arranque**: `scripts/start_jarvis.ps1` lanza `jarvis.ui.overlay` junto con
+`jarvis.audio.pipeline` (dos `Start-Process` independientes, logs separados:
+`data/jarvis-overlay.log`/`data/jarvis-overlay-error.log`). Para correrlo manualmente:
+
+```powershell
+python -m jarvis.ui.overlay             # con consola, para depurar
+pythonw -m jarvis.ui.overlay            # sin consola, mismo modo que usa el arranque automático
+```
+
 ## Memoria persistente
 
 SQLite (`src/jarvis/memory/store.py`, `data/jarvis.db`), stdlib `sqlite3` sin ORM. Cuatro tablas,
@@ -466,12 +504,16 @@ jarvis/
 │   │   └── game_mode.py        detección de modo de juego (Arena/ARAM) compartida entre tools
 │   ├── llm/
 │   │   └── client.py           LLMClient / DeepSeekClient — interfaz swappable de proveedor
+│   ├── ui/
+│   │   ├── status.py           contrato de estado (StatusState/write_status/read_status/
+│   │   │                       StatusHeartbeat) compartido entre pipeline y overlay
+│   │   └── overlay.py          ventana flotante Tkinter, proceso separado (ADR-0008)
 │   └── config.py               carga de .env (sin dependencia externa)
-├── tests/                      espeja src/ (audio/, tools/, security/, memory/, league/)
+├── tests/                      espeja src/ (audio/, tools/, security/, memory/, league/, ui/)
 ├── scripts/
 │   ├── start_jarvis.ps1        wrapper de arranque para la Tarea Programada de Windows
 │   └── diagnose_wakeword.py    utilidad de diagnóstico de umbral de wake word
-├── docs/decisions/             ADRs (0001-0006)
+├── docs/decisions/             ADRs (0001-0008)
 └── .claude/
     ├── rules/                  convenciones por dominio (python, windows, arquitectura, seguridad, git, testing, agents)
     ├── agents/                 subagentes especializados (architect, security-reviewer, python-engineer, ...)
@@ -480,7 +522,8 @@ jarvis/
 ```
 
 `data/` (gitignored, creado en runtime) contiene `jarvis.db` (SQLite), `jarvis.log`/
-`jarvis-error.log` (stdout/stderr redirigidos por `start_jarvis.ps1`) y `screenshots/`.
+`jarvis-error.log`/`jarvis-overlay.log`/`jarvis-overlay-error.log` (stdout/stderr redirigidos por
+`start_jarvis.ps1`), `status.json` (estado en vivo para el overlay, ADR-0008) y `screenshots/`.
 
 ## Workflow de desarrollo
 
@@ -563,6 +606,8 @@ Extraídas de comentarios/docstrings reales del código, no inventadas para este
   | 0004 | Stack funcional de JARVIS (DeepSeek, SQLite, voz completa con wake word/STT/TTS swappables, arranque por Tarea Programada, confirmación verbal con "silencio = denegar"). |
   | 0005 | Tool-calling en runtime: planner = function-calling nativo + dispatch loop bespoke; `Tool` como ABC con `risk` estático obligatorio; `PolicyEngine` como único gate hacia `execute()`. |
   | 0006 | Un parámetro que cambia el radio de impacto de una acción se resuelve partiendo el tool en dos (cada uno con `risk` fijo), nunca evaluando riesgo condicional dentro de `PolicyEngine`. |
+  | 0007 | Captura de comandos migra a transcripción en streaming (Realtime API); las confirmaciones habladas se quedan en el camino batch por fiabilidad verificable (`logprobs`). |
+  | 0008 | Overlay flotante de estado (primera UI del proyecto) como proceso separado de `run()`, comunicado por un archivo JSON simple (`data/status.json`) en vez de socket o memoria compartida. |
 
 - **`.claude/rules/`** — convenciones vigentes por dominio: `python.md` (tipado estricto, async,
   sin `except Exception` silencioso salvo frontera documentada), `windows.md` (capa Windows de

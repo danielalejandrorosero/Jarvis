@@ -213,6 +213,7 @@ from jarvis.tools.system_power import SystemPowerTool
 from jarvis.tools.timer import TimerTool
 from jarvis.tools.volume_control import VolumeControlTool
 from jarvis.tools.weather import WeatherTool
+from jarvis.ui.status import StatusHeartbeat, StatusState
 
 COMMAND_WINDOW_SECONDS = 20.0  # tope duro: si nunca hay silencio, no graba para siempre
 # Antes en 4.0 — cortaba la grabación aunque el usuario siguiera hablando, no solo cuando
@@ -1601,6 +1602,16 @@ def run(
     # puntos de entrada que registran algo acá.
     timer_scheduler = TimerScheduler(tts=tts)
     timer_scheduler.start()
+    # Cuarto servicio de fondo, mismo lifecycle start()/stop(): mantiene fresco `data/status.json`
+    # para `jarvis.ui.overlay` (ADR-0008), incluso durante los minutos que este loop puede pasar
+    # bloqueado esperando la wake word sin ninguna transición de estado real de por medio — ver
+    # docstring de `jarvis.ui.status.StatusHeartbeat` para el hallazgo en vivo que motiva esto
+    # (confirmado contra el proceso real: sin el heartbeat, el overlay se mostraba como
+    # "desconectado" pasados unos segundos de espera normal de la wake word, aunque `run()`
+    # seguía vivo). `status_heartbeat.update(...)` reemplaza cualquier llamada directa a
+    # `jarvis.ui.status.write_status` en el resto de esta función.
+    status_heartbeat = StatusHeartbeat()
+    status_heartbeat.start()
 
     tools: dict[str, Tool] = {
         tool.name: tool
@@ -1660,6 +1671,16 @@ def run(
 
     deadline = time.monotonic() + duration if duration is not None else None
     sleeping = False
+    # Estado en vivo para el overlay flotante (`jarvis.ui.overlay`, ADR-0008) —
+    # `status_heartbeat.update()` nunca lanza (delega a `write_status`, ver docstring de
+    # `jarvis.ui.status`), así que ninguna de estas llamadas necesita su propio `try/except`: son
+    # parte del mismo espíritu de resiliencia que el resto de `run()`, pero la frontera de
+    # recuperación ya vive adentro de `write_status` mismo, no acá en cada call site.
+    # `last_status_text` es "lo último relevante que se dijo" (comando del usuario o respuesta de
+    # JARVIS, lo que haya sido más reciente) — se actualiza en cada transición real, nunca se
+    # limpia a vacío entre turnos, para que el overlay siga mostrando algo útil incluso mientras
+    # JARVIS vuelve a estado `idle` esperando la próxima wake word.
+    last_status_text = ""
     print(
         "Escuchando... decí 'Alexa', 'Hey Jarvis' o 'Hey Mycroft' "
         f"(Ctrl+C para salir, umbral={threshold})",
@@ -1668,9 +1689,13 @@ def run(
     # Corre sin ventana visible (arranque automático, ver scripts/start_jarvis.ps1) — este es el
     # único aviso de que arrancó bien y quedó escuchando (pedido explícito del usuario: "al
     # iniciar quiero que se presente para saber si está en buen estado").
-    tts.speak("Alexa activa y funcionando correctamente.")
+    greeting = "Alexa activa y funcionando correctamente."
+    last_status_text = greeting
+    status_heartbeat.update(StatusState.SPEAKING, last_status_text)
+    tts.speak(greeting)
     try:
         while deadline is None or time.monotonic() < deadline:
+            status_heartbeat.update(StatusState.IDLE, last_status_text)
             remaining = (deadline - time.monotonic()) if deadline is not None else None
             frames = iter_microphone_frames(device=device, duration=remaining)
             pre_roll_buffer: deque[np.ndarray] = deque(maxlen=PRE_ROLL_FRAMES)
@@ -1741,6 +1766,7 @@ def run(
                         else FOLLOW_UP_WINDOW_SECONDS
                     )
                     first_listen = False
+                    status_heartbeat.update(StatusState.LISTENING, last_status_text)
                     # Captura + transcripción en streaming (`jarvis.audio.realtime_stt`,
                     # `gpt-live-transcribe` vía la Realtime API) en vez del combo
                     # `record_command()` + `transcribe()` batch de antes — mismo contrato de
@@ -1784,6 +1810,10 @@ def run(
                         if _contains_any_word(text, _WAKE_WORDS):
                             sleeping = False
                             wake_reply = "Volví. ¿En qué te ayudo?"
+                            last_status_text = wake_reply
+                            status_heartbeat.update(
+                                StatusState.SPEAKING, last_status_text
+                            )
                             print(f"JARVIS: {wake_reply}")
                             tts.speak(wake_reply)
                         else:
@@ -1794,10 +1824,14 @@ def run(
                     elif _contains_any_word(text, _SLEEP_WORDS):
                         sleeping = True
                         sleep_reply = 'Listo, descanso. Decime "Alexa, volvé" cuando me necesites.'
+                        last_status_text = sleep_reply
+                        status_heartbeat.update(StatusState.SPEAKING, last_status_text)
                         print(f"JARVIS: {sleep_reply}")
                         tts.speak(sleep_reply)
                         awaiting_wake_word = True
                     else:
+                        last_status_text = text
+                        status_heartbeat.update(StatusState.THINKING, last_status_text)
                         reply = dispatch_turn(
                             text,
                             llm=llm,
@@ -1808,7 +1842,17 @@ def run(
                         )
                         print(f"JARVIS: {reply}")
                         if reply.strip():
+                            last_status_text = reply
+                            status_heartbeat.update(
+                                StatusState.SPEAKING, last_status_text
+                            )
                             tts.speak(reply)
+                        else:
+                            # Respuesta final vacía a propósito (ej. `open_url` reproduciendo
+                            # una canción — ver `SYSTEM_PROMPT`): no hay nada que hablar, así
+                            # que no tiene sentido mostrar `speaking` — vuelve a `idle` ya mismo
+                            # en vez de esperar a la próxima vuelta del loop externo.
+                            status_heartbeat.update(StatusState.IDLE, last_status_text)
                         awaiting_wake_word = (
                             False  # comando real -> abrir ventana de seguimiento
                         )
@@ -1819,6 +1863,7 @@ def run(
                     # responder hasta el próximo reinicio manual — este turno se pierde, pero el
                     # siguiente "Hey Jarvis"/"Alexa" sigue funcionando en vez de silencio total).
                     print(f"Error procesando el turno: {exc!r}", file=sys.stderr)
+                    status_heartbeat.update(StatusState.IDLE, last_status_text)
                     awaiting_wake_word = True
                 time.sleep(COOLDOWN_SECONDS)
     except KeyboardInterrupt:
@@ -1827,6 +1872,7 @@ def run(
         system_audio.stop()
         league_auto_accept.stop()
         timer_scheduler.stop()
+        status_heartbeat.stop()
     print("Fin de la escucha.", file=sys.stderr)
 
 
