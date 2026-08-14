@@ -32,14 +32,13 @@ repositorio — este README las resume y las aplica en el código real, no las r
 2. [El contrato `Tool` / `RiskLevel` / `PolicyEngine`](#el-contrato-tool--risklevel--policyengine)
 3. [Inventario completo de tools](#inventario-completo-de-tools)
 4. [Pipeline de voz](#pipeline-de-voz)
-5. [Overlay flotante de estado](#overlay-flotante-de-estado)
-6. [Memoria persistente](#memoria-persistente)
-7. [Integración con League of Legends](#integración-con-league-of-legends)
-8. [Stack y dependencias](#stack-y-dependencias)
-9. [Estructura del repositorio](#estructura-del-repositorio)
-10. [Workflow de desarrollo](#workflow-de-desarrollo)
-11. [Limitaciones conocidas / riesgos abiertos](#limitaciones-conocidas--riesgos-abiertos)
-12. [Dónde seguir leyendo](#dónde-seguir-leyendo)
+5. [Memoria persistente](#memoria-persistente)
+6. [Integración con League of Legends](#integración-con-league-of-legends)
+7. [Stack y dependencias](#stack-y-dependencias)
+8. [Estructura del repositorio](#estructura-del-repositorio)
+9. [Workflow de desarrollo](#workflow-de-desarrollo)
+10. [Limitaciones conocidas / riesgos abiertos](#limitaciones-conocidas--riesgos-abiertos)
+11. [Dónde seguir leyendo](#dónde-seguir-leyendo)
 
 ## Arquitectura: trace de una acción real
 
@@ -55,8 +54,11 @@ confirmación verbal).
    (`TRAILING_SILENCE_SECONDS`) después de haber detectado habla real (`speech_detected=True`) —
    nunca manda a transcribir audio sin habla real, para no alimentar alucinaciones del STT sobre
    silencio puro.
-3. **STT**: `transcribe()` (`src/jarvis/audio/stt.py`) llama a `gpt-4o-transcribe` de OpenAI y
-   devuelve `"cerrá Discord"`.
+3. **STT**: `stream_transcribe_command()` (`src/jarvis/audio/realtime_stt.py`) transmite el audio
+   en streaming a la Realtime API de Speechmatics (ADR-0012) a medida que se graba y devuelve
+   `"cerrá Discord"` — el corte de turno lo sigue decidiendo el VAD local, nunca el servidor.
+   `transcribe()` (`src/jarvis/audio/stt.py`, `gpt-4o-transcribe` de OpenAI, batch) sigue en uso,
+   pero solo para las confirmaciones habladas del paso 7 (`VoiceConfirmationChannel`).
 4. **ORCHESTRATOR + PLANNER (`dispatch_turn`, `src/jarvis/audio/pipeline.py`)**: arma
    `messages` con el system prompt (`_build_system_prompt`, incluye hechos/estilo/historial
    recordados) y llama a `llm.complete(messages, tools=tool_schemas)`. El "planner" acá **es** el
@@ -242,21 +244,31 @@ Loop principal en `pipeline.run()` (`src/jarvis/audio/pipeline.py`):
    "alexa"/"hey_mycroft" reusan el mismo valor sin calibración propia): `alexa`, `hey_jarvis`,
    `hey_mycroft`. Un `SystemAudioGate` opcional (`SystemAudioMonitor`) suprime detecciones
    mientras el sistema está sonando fuerte, para no disparar por audio de un juego o música.
-2. **Gating de grabación** (`record_command`): graba hasta silencio sostenido
-   (`TRAILING_SILENCE_SECONDS=1.2s`) tras detectar habla real, con un tope duro
-   (`COMMAND_WINDOW_SECONDS=20s`) como red de seguridad si el silencio nunca llega. Devuelve
-   `(audio, speech_detected)` — **`speech_detected=False` salta la llamada a `transcribe()`
-   directamente**: es la mitigación real (no un filtro posterior) contra una cascada de
-   alucinaciones del STT confirmada en vivo (`data/jarvis.log`): texto inventado en idiomas al
-   azar sobre silencio/ruido ambiente puro. Un umbral de silencio/voz calibrado por sesión
-   (`measure_noise_floor`/`calibrate_thresholds`, mediana de sub-chunks para ignorar picos
-   puntuales) reemplaza un número fijo. Un colchón de `PRE_ROLL_SECONDS=0.5s` de audio previo a
-   la wake word se pega al comando, para no perder las primeras palabras si el usuario habla
-   pegado a "Hey Jarvis" sin pausa.
-3. **STT**: `gpt-4o-transcribe` de OpenAI (`audio/stt.py`), reemplazó a `faster-whisper` local
-   tras confirmar en vivo que la API entendía audio que el modelo local devolvía vacío. Sin
-   `prompt` de hint de vocabulario: se probaron dos versiones y ambas terminaron
-   "alucinadas de vuelta" sobre silencio real, contaminando la memoria de hechos.
+2. **Gating de grabación** (`jarvis.audio.vad`, usado tanto por `record_command` como por
+   `stream_transcribe_command`): graba/transmite hasta silencio sostenido
+   (`TRAILING_SILENCE_SECONDS=0.7s`, recomendación de Speechmatics para voice AI, ADR-0012) tras
+   detectar habla real, con un tope duro (`COMMAND_WINDOW_SECONDS=20s`) como red de seguridad si
+   el silencio nunca llega. El corte de turno lo decide siempre este VAD local — nunca el
+   servidor, ni el de OpenAI (que lo rechaza por completo para este modo) ni el de Speechmatics
+   (que sí lo soporta del lado del servidor pero se deja explícitamente desactivado). Devuelve
+   `speech_detected`: `False` salta la transcripción por completo — es la mitigación real (no un
+   filtro posterior) contra una cascada de alucinaciones del STT confirmada en vivo (logs de
+   `data/logs/`): texto inventado en idiomas al azar sobre silencio/ruido ambiente puro. Un
+   umbral de silencio/voz calibrado por sesión (`measure_noise_floor`/`calibrate_thresholds`,
+   percentil de sub-chunks para ignorar picos puntuales) reemplaza un número fijo. Un colchón de
+   `PRE_ROLL_SECONDS=0.5s` de audio previo a la wake word se pega al comando, para no perder las
+   primeras palabras si el usuario habla pegado a "Hey Jarvis" sin pausa.
+3. **STT**: la captura de comandos generales transmite en streaming a la Realtime API de
+   **Speechmatics** (`audio/realtime_stt.py`, modelo `enhanced`, ADR-0012) — migrado desde la
+   Realtime API de OpenAI (`gpt-live-transcribe`, ADR-0007) tras un benchmark independiente en
+   español latinoamericano que midió 7.3% WER para Speechmatics contra 9.5-9.8% para
+   GPT-4o/Whisper/Deepgram en el mismo corpus. Las confirmaciones habladas CONFIRM (sí/no antes de
+   una acción irreversible) siguen en el camino batch, `gpt-4o-transcribe` de OpenAI (`audio/
+   stt.py`, que a su vez reemplazó a `faster-whisper` local tras confirmar en vivo que la API
+   entendía audio que el modelo local devolvía vacío) — decisión deliberada, no todavía migrada:
+   ahí la fiabilidad probada y la observabilidad de confianza (`logprobs`) pesan más que la
+   latencia. Sin `prompt`/vocabulario de hint en ninguno de los dos caminos: se probaron variantes
+   y terminaron "alucinadas de vuelta" sobre silencio real, contaminando la memoria de hechos.
 4. **`dispatch_turn`**: ver el trace completo en la sección de arquitectura. `MAX_TOOL_CALLS_PER_TURN=5`
    corta el turno si el LLM insiste en pedir tools (antes en 3, insuficiente para flujos de
    `search_web` + `open_url` encadenados). Si el turno pide un tool, JARVIS dice una frase de
@@ -276,43 +288,6 @@ Loop principal en `pipeline.run()` (`src/jarvis/audio/pipeline.py`):
    completo hasta el próximo reinicio manual. `sys.stdout`/`sys.stderr` se reconfiguran a
    `utf-8`/`errors="replace"` al arrancar por el mismo motivo (arranque automático vía
    `pythonw.exe`, sin consola, usa cp1252 por default en Windows).
-
-## Overlay flotante de estado
-
-Primera interfaz visual del proyecto (ADR-0008) — hasta esta fase JARVIS era puramente background,
-sin ningún rastro más allá de voz y `data/jarvis.log`. `jarvis.ui.overlay` es una ventanita
-flotante, sin bordes, siempre encima, en la esquina inferior derecha de la pantalla, que muestra
-en vivo si Alexa está esperando la wake word, escuchando un comando, pensando (esperando al
-LLM/tools) o hablando, más lo último dicho (comando del usuario o respuesta de JARVIS, truncado a
-una línea). Corre como **proceso separado** de `jarvis.audio.pipeline.run()` — nunca comparte
-intérprete ni loop de eventos con el pipeline de voz (`asyncio` vs. el `mainloop()` bloqueante de
-Tk) — así que matar o reiniciar cualquiera de los dos nunca afecta al otro.
-
-Comunicación entre ambos procesos: un archivo JSON plano, `data/status.json`
-(`jarvis.ui.status.write_status`/`read_status`), que `run()` escribe en cada transición de estado
-real y que el overlay sondea cada ~200ms vía `Tk.after()`. Un `StatusHeartbeat` de fondo
-(`jarvis.ui.status`, mismo patrón `start()`/`stop()` que `SystemAudioMonitor`/
-`LCUAutoAcceptMonitor`/`TimerScheduler`) reescribe el último estado conocido cada 2s aunque no haya
-ninguna transición nueva — necesario porque `run()` puede pasar minutos bloqueado esperando la
-wake word sin ningún evento real de por medio. Si el archivo no existe o quedó más viejo que 5s, el
-overlay se muestra como "sin conexión" en vez de mostrar un estado desactualizado como si fuera en
-vivo. Ninguna escritura de estado puede tumbar un turno de voz real (`write_status` nunca lanza,
-misma frontera de recuperación que el resto de `run()`) y el pipeline nunca depende de que el
-overlay exista — degradación en ambas direcciones, ver ADR-0008 para el detalle completo.
-
-`GUI: tkinter` (stdlib, sin dependencia nueva) — ventana frameless (`overrideredirect`),
-always-on-top (`-topmost`), semi-transparente (`-alpha`) y oculta de la barra de tareas
-(`-toolwindow`), sin robar foco a la ventana activa (pedido explícito: no debe interrumpir mientras
-se juega).
-
-**Arranque**: `scripts/start_jarvis.ps1` lanza `jarvis.ui.overlay` junto con
-`jarvis.audio.pipeline` (dos `Start-Process` independientes, logs separados:
-`data/jarvis-overlay.log`/`data/jarvis-overlay-error.log`). Para correrlo manualmente:
-
-```powershell
-python -m jarvis.ui.overlay             # con consola, para depurar
-pythonw -m jarvis.ui.overlay            # sin consola, mismo modo que usa el arranque automático
-```
 
 ## Memoria persistente
 
@@ -427,7 +402,6 @@ dependencies = [
     "numpy>=1.26",
     "openai>=1.0",
     "httpx>=0.27",
-    "pyttsx3>=2.90",
     "playsound3>=3.0",
     "psutil>=6.0",   # system_info: CPU/RAM sin WMI verboso/inestable
     "Pillow>=10.0",  # screenshot: PIL.ImageGrab sin GDI a mano vía ctypes
@@ -440,8 +414,13 @@ dev = ["ruff>=0.6", "mypy>=1.11", "pytest>=8.3", "types-psutil>=6.0"]
 Por qué cada una, más allá de "lo necesita esta feature":
 
 - **`openai>=1.0`**: un solo SDK cubre tres proveedores distintos — DeepSeek (endpoint compatible
-  con el formato OpenAI, `base_url` apuntado a `api.deepseek.com`), STT (`gpt-4o-transcribe`) y
-  TTS (`gpt-4o-mini-tts`), sin tres dependencias separadas.
+  con el formato OpenAI, `base_url` apuntado a `api.deepseek.com`), STT batch (`gpt-4o-transcribe`,
+  solo confirmaciones CONFIRM) y TTS (`gpt-4o-mini-tts`), sin tres dependencias separadas.
+- **`websockets>=13,<16`**: habla el protocolo WebSocket documentado de la Realtime API de
+  Speechmatics directamente (`jarvis.audio.realtime_stt`, streaming STT para captura de comandos,
+  ADR-0012) en vez de sumar el SDK oficial `speechmatics-rt` — su modelo de eventos no expone
+  públicamente la tarea de recepción que este módulo necesita para el backstop de "conexión caída
+  sin avisar" (ver docstring de `realtime_stt.py`).
 - **`httpx>=0.27`, no `requests`**: ya venía como dependencia transitiva de `openai`, así que
   usarla para `weather.py`/`search.py`/los tools de League no suma una dependencia nueva. Soporta
   cliente **async** nativo (`httpx.AsyncClient`, usado en `weather.py`/`search.py` sin necesitar
@@ -454,8 +433,9 @@ Por qué cada una, más allá de "lo necesita esta feature":
 - **`Pillow>=10.0`** (misma clase de excepción): sin esto, capturar pantalla en Windows requiere
   GDI a mano vía `ctypes` (device context, bitmap, `BitBlt`) — decenas de líneas de boilerplate
   para lo que `ImageGrab.grab()` resuelve en una llamada.
-- **`pyttsx3`/`playsound3`**: fallback TTS local (SAPI, siempre disponible sin red) y
-  reproducción del audio generado por el TTS primario de OpenAI, respectivamente.
+- **`playsound3`**: reproducción del audio generado por el TTS de OpenAI. No hay fallback local de
+  TTS (ver ADR-0011: `pyttsx3`/SAPI se sacaron del repo a pedido explícito del usuario — un fallo
+  de la API de OpenAI ahora se pierde ese turno puntual en vez de degradar a voz robótica).
 - **`openwakeword`/`sounddevice`/`numpy`**: detección de wake word y captura/procesamiento de
   audio — sin alternativa razonable en stdlib para ninguno de los tres.
 
@@ -471,9 +451,9 @@ Notas de versión relevantes:
   silencio, pero la variable no está documentada donde debería.
 
 `mypy` corre en modo `strict` sobre `src/` (`[tool.mypy] strict = true`), con overrides de
-`ignore_missing_imports` para `sounddevice`, `openwakeword.*`, `pyttsx3.*`, `playsound3.*` (sin
-stubs de tipos publicados). `pytest` usa `testpaths = ["tests"]` y `pythonpath = ["src"]` — no
-hace falta instalar el paquete en modo editable para correr la suite.
+`ignore_missing_imports` para `sounddevice`, `openwakeword.*`, `playsound3.*` (sin stubs de tipos
+publicados). `pytest` usa `testpaths = ["tests"]` y `pythonpath = ["src"]` — no hace falta instalar
+el paquete en modo editable para correr la suite.
 
 ## Estructura del repositorio
 
@@ -487,8 +467,11 @@ jarvis/
 │   ├── audio/
 │   │   ├── pipeline.py         loop principal: wake word → STT → dispatch_turn → TTS
 │   │   ├── wake_word.py        detección de wake word (openWakeWord)
-│   │   ├── stt.py              transcripción (OpenAI gpt-4o-transcribe)
-│   │   ├── tts.py              texto a voz (OpenAI primario, SAPI fallback)
+│   │   ├── stt.py              transcripción batch (OpenAI gpt-4o-transcribe) — solo confirmaciones CONFIRM
+│   │   ├── realtime_stt.py     transcripción en streaming (Speechmatics, ADR-0012) — captura de comandos
+│   │   ├── vad.py              VAD local puro (RMS + corte por silencio), usado por ambos caminos de STT
+│   │   ├── speech_detector.py  detector de voz real (Silero VAD) — "¿esto suena a voz humana?"
+│   │   ├── tts.py              texto a voz (OpenAI, sin fallback local — ver ADR-0011)
 │   │   ├── loopback.py         SystemAudioMonitor — loopback WASAPI, gate de audio del sistema
 │   │   ├── device.py           resolución de dispositivos de entrada/salida (WASAPI vs MME)
 │   │   ├── resample.py         resampleo de audio entre sample rates
@@ -504,16 +487,12 @@ jarvis/
 │   │   └── game_mode.py        detección de modo de juego (Arena/ARAM) compartida entre tools
 │   ├── llm/
 │   │   └── client.py           LLMClient / DeepSeekClient — interfaz swappable de proveedor
-│   ├── ui/
-│   │   ├── status.py           contrato de estado (StatusState/write_status/read_status/
-│   │   │                       StatusHeartbeat) compartido entre pipeline y overlay
-│   │   └── overlay.py          ventana flotante Tkinter, proceso separado (ADR-0008)
 │   └── config.py               carga de .env (sin dependencia externa)
-├── tests/                      espeja src/ (audio/, tools/, security/, memory/, league/, ui/)
+├── tests/                      espeja src/ (audio/, tools/, security/, memory/, league/)
 ├── scripts/
 │   ├── start_jarvis.ps1        wrapper de arranque para la Tarea Programada de Windows
 │   └── diagnose_wakeword.py    utilidad de diagnóstico de umbral de wake word
-├── docs/decisions/             ADRs (0001-0008)
+├── docs/decisions/             ADRs (0001-0010)
 └── .claude/
     ├── rules/                  convenciones por dominio (python, windows, arquitectura, seguridad, git, testing, agents)
     ├── agents/                 subagentes especializados (architect, security-reviewer, python-engineer, ...)
@@ -521,9 +500,9 @@ jarvis/
     └── hooks/                  guard-dangerous-commands.ps1, protect-sensitive-files.ps1, python-format-on-save.ps1
 ```
 
-`data/` (gitignored, creado en runtime) contiene `jarvis.db` (SQLite), `jarvis.log`/
-`jarvis-error.log`/`jarvis-overlay.log`/`jarvis-overlay-error.log` (stdout/stderr redirigidos por
-`start_jarvis.ps1`), `status.json` (estado en vivo para el overlay, ADR-0008) y `screenshots/`.
+`data/` (gitignored, creado en runtime) contiene `jarvis.db` (SQLite), un
+`jarvis-<timestamp>.log`/`jarvis-<timestamp>-error.log` por cada arranque (stdout/stderr
+redirigidos por `start_jarvis.ps1` — nunca se pisan entre reinicios) y `screenshots/`.
 
 ## Workflow de desarrollo
 
@@ -541,8 +520,11 @@ python -m mypy src            # type-check estricto
   máquina). Setea `PYTHONPATH` manualmente (no se puede en la acción de una Tarea Programada
   directamente) y lanza `pythonw.exe -u -m jarvis.audio.pipeline` — el flag **`-u`
   (unbuffered) no es cosmético**: sin consola adjunta, Python bufferea stdout por bloque en vez
-  de por línea, y sin él `data/jarvis.log` quedaba vacío durante horas de uso real hasta que el
-  proceso terminaba.
+  de por línea, y sin él el log del arranque quedaba vacío durante horas de uso real hasta que el
+  proceso terminaba. Cada arranque escribe a un `jarvis-<timestamp>.log`/
+  `jarvis-<timestamp>-error.log` propio en `data/`, nunca pisa el de la corrida anterior — antes
+  se sobreescribía un archivo fijo en cada reinicio, perdiendo la historia justo cuando más hacía
+  falta para diagnosticar un bug.
 - **Todo tool nuevo que toque filesystem, procesos, red o registro** pasa por revisión
   independiente de `security-reviewer` (`.claude/agents/security-reviewer.md`) antes de
   considerarse terminado — reporta hallazgos, no los arregla directamente (preserva
@@ -608,6 +590,10 @@ Extraídas de comentarios/docstrings reales del código, no inventadas para este
   | 0006 | Un parámetro que cambia el radio de impacto de una acción se resuelve partiendo el tool en dos (cada uno con `risk` fijo), nunca evaluando riesgo condicional dentro de `PolicyEngine`. |
   | 0007 | Captura de comandos migra a transcripción en streaming (Realtime API); las confirmaciones habladas se quedan en el camino batch por fiabilidad verificable (`logprobs`). |
   | 0008 | Overlay flotante de estado (primera UI del proyecto) como proceso separado de `run()`, comunicado por un archivo JSON simple (`data/status.json`) en vez de socket o memoria compartida. |
+  | 0009 | Panel del overlay extendido con chat tipeado bidireccional y medidor de nivel de mic en vivo. |
+  | 0010 | Overlay flotante eliminado por completo (código, tests, integración en `pipeline.py`) tras varias iteraciones visuales rechazadas — JARVIS vuelve a ser puramente por voz, sin superficie visual. |
+  | 0011 | Fallback local de TTS (`pyttsx3`/SAPI) eliminado a pedido explícito del usuario — un fallo de la API de OpenAI ahora pierde ese turno puntual en vez de degradar a voz robótica. |
+  | 0012 | Captura de comandos en streaming migra de la Realtime API de OpenAI a la de Speechmatics — benchmark independiente en español latinoamericano con menor WER; las confirmaciones habladas se quedan en el camino batch de OpenAI (sin cambios respecto a ADR-0007). |
 
 - **`.claude/rules/`** — convenciones vigentes por dominio: `python.md` (tipado estricto, async,
   sin `except Exception` silencioso salvo frontera documentada), `windows.md` (capa Windows de
