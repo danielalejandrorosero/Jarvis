@@ -2,9 +2,11 @@
 
 Endpoints usados:
 
-- `GET /lol-gameflow/v1/gameflow-phase` (mismo endpoint que ya usa
-  `jarvis.league.lcu_monitor.LCUAutoAcceptMonitor._poll_gameflow` para su propio polling — se
-  reutiliza la misma constante `GAMEFLOW_PHASE_ENDPOINT` de ese módulo en vez de redeclararla):
+- `GET /lol-gameflow/v1/gameflow-phase` (mismo endpoint que consulta
+  `jarvis.league.lcu_monitor.LCUAutoAcceptMonitor` — vía el websocket de eventos de la LCU desde
+  que ese monitor dejó de hacer polling REST, ver docstring de ese módulo; acá sí es un GET REST
+  puntual, no un stream — se reutiliza la misma constante `GAMEFLOW_PHASE_ENDPOINT` de ese módulo
+  en vez de redeclararla):
   devuelve un string plano (`response.json()` es directamente `"Lobby"`, `"Matchmaking"`,
   `"ReadyCheck"`, etc. — no un objeto), se consulta acá antes de intentar nada, para dar un
   mensaje claro y específico según en qué fase esté el usuario en vez de un error genérico de la

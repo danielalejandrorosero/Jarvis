@@ -42,11 +42,77 @@ a nivel de proceso/librería ni para ningún otro cliente HTTP de JARVIS (`jarvi
 
 Resiliencia (mismo estándar que `SystemAudioMonitor`, ver `jarvis.audio.loopback`): "League no
 está corriendo" es un estado normal y esperado (el usuario no siempre está jugando), no un error —
-se loguea una sola vez a nivel INFO por transición de estado, no en cada poll. Si el cliente se
+se loguea una sola vez a nivel INFO por transición de estado, no en cada intento. Si el cliente se
 cierra a mitad de sesión (lockfile desaparece, la conexión empieza a fallar), el monitor vuelve al
 estado "esperando a que arranque League" sin tumbar el thread; un error inesperado cualquiera en
-el ciclo de polling se atrapa en el borde exterior (`_run`) por el mismo motivo documentado en
-`jarvis.audio.pipeline.run()` — un fallo puntual no puede tumbar el thread de fondo entero.
+el ciclo de conexión se atrapa en el borde exterior (`_async_run`) por el mismo motivo documentado
+en `jarvis.audio.pipeline.run()` — un fallo puntual no puede tumbar el thread de fondo entero.
+
+Detección de ready-check: WEBSOCKET de eventos de la LCU, no polling REST (bug real corregido acá,
+no solo mitigado — ver más abajo). Versiones previas de este módulo hacían polling de
+`GET /lol-gameflow/v1/gameflow-phase` cada `GAMEFLOW_POLL_SECONDS`; reportado en vivo por el
+usuario: la PRIMERA cola de una sesión se aceptaba bien, pero si algún jugador rechazaba y
+aparecía una segunda cola (requeue), esa segunda no se aceptaba. Causa (carrera de polling, no
+adivinada — reproducible por análisis del código, no confirmada con una repro en vivo porque
+requeues son intermitentes): si tras un rechazo la fase pasaba brevemente por un estado intermedio
+(p.ej. `"Matchmaking"`) y volvía a `"ReadyCheck"` en menos de `GAMEFLOW_POLL_SECONDS`, el polling
+podía no muestrear nunca ese estado intermedio — dos lecturas consecutivas daban `"ReadyCheck"`
+sin que el código notara la transición, y la guarda que evita aceptar dos veces la MISMA aparición
+de un ready-check (`ready_check_handled`) se quedaba en `True` para siempre, sin volver a aceptar.
+Bajar el intervalo de poll solo reduce la probabilidad de la carrera, no la elimina (siempre existe
+un intervalo de tiempo, por chico que sea, en el que una transición ida-y-vuelta puede colarse sin
+ser muestreada) — por eso la corrección real es dejar de hacer polling, no acelerarlo.
+
+Protocolo del websocket de eventos, confirmado en vivo contra la documentación oficial no oficial
+(hextechdocs.dev/getting-started-with-the-lcu-websocket, comunitaria pero estándar — mismo tipo de
+fuente que ya cita el resto de este módulo) y contra el código fuente real de la implementación de
+referencia ya citada arriba (`moleicafe/lol-auto-accept`, `laa/lcu/connector.py` — arquitectura
+confirmada: "a background thread... connects to the local LCU over HTTPS + a websocket, and
+streams typed game-phase events into a pure-logic engine"), no adivinado:
+
+- WAMP 1.0 sobre WebSocket. Conexión SIEMPRE a `wss://127.0.0.1:<puerto>/` — a diferencia de la
+  conexión REST (`_build_client`, que sí usa el campo `protocolo` del lockfile), el websocket de
+  eventos de la LCU es siempre `wss`, nunca `ws` en la práctica real (confirmado en la doc oficial:
+  el ejemplo de conexión usa `wss://` sin condicional) — este módulo lo hardcodea igual que ya
+  hardcodea `127.0.0.1` para la conexión REST, en vez de derivarlo del campo `protocolo` del
+  lockfile (que es para HTTP, no para el websocket).
+- Auth: mismo header HTTP Basic que la conexión REST (`riot:<password>`) pasado en el handshake de
+  conexión del websocket — confirmado explícitamente: "you still have to pass in the authorization
+  header as if you were calling an LCU endpoint".
+- Todo mensaje es un array JSON; el primer elemento es un opcode. `[5, "OnJsonApiEvent"]` (opcode
+  5 = subscribe) suscribe a TODOS los eventos JSON que emite el cliente. Los eventos push llegan
+  con opcode 8: `[8, "<nombre-evento>", {"uri": ..., "eventType": "Create"|"Update"|"Delete",
+  "data": ...}]` — confirmado con el ejemplo real de la documentación:
+  `[8,"OnJsonApiEvent",{"data":[],"eventType":"Update","uri":"/lol-ranked/v1/notifications"}]`.
+  Sin nombre de evento filtrado confirmado específicamente para `gameflow-phase` en la
+  documentación oficial (existe la posibilidad de suscribirse a un evento más específico en vez
+  del genérico, pero su nombre exacto para este endpoint no está documentado) — este módulo se
+  suscribe al genérico `OnJsonApiEvent` y filtra él mismo por `uri` en el handler
+  (`_extract_gameflow_phase`), alternativa explícitamente válida y más segura que adivinar un
+  nombre de evento no confirmado. Para `/lol-gameflow/v1/gameflow-phase`, `data` es directamente
+  el string de la fase (mismo shape que ya devolvía `response.json()` del endpoint REST
+  equivalente — confirmado además contra `_parse_message` de la implementación de referencia:
+  `uri == "/lol-gameflow/v1/gameflow-phase" and isinstance(data, str)`).
+
+Con push de eventos en vez de sampling periódico es estructuralmente imposible perderse una
+transición de fase, sin importar cuán rápido pase — la clase de bug reportada (no solo la
+probabilidad) queda eliminada. El accept en sí sigue siendo `POST /lol-matchmaking/v1/ready-check/
+accept` vía REST (`_accept_ready_check`) — solo cambió CÓMO se detecta que hay un ready-check
+nuevo, no cómo se acepta.
+
+Puente sync/async: `LCUAutoAcceptMonitor` sigue siendo un `threading.Thread` daemon de fondo (el
+resto de este módulo, y su consumidor en `jarvis.audio.pipeline.run()`, son código síncrono), pero
+`websockets` es una librería async — `_run()` corre su propio loop de asyncio dedicado
+(`asyncio.run(self._async_run())`) dentro de ese thread, igual que cualquier programa async
+standalone; no comparte loop con nada más del proceso. `stop()` (llamado desde OTRO thread) señala
+el mismo `threading.Event` de siempre (`_stop_event`); `_async_run` lo consume desde el lado async
+vía un único `asyncio.to_thread(self._stop_event.wait)` de larga duración, creado una sola vez por
+`start()` (no uno nuevo por evento recibido ni por intento de reconexión — eso acumularía threads
+del pool de `to_thread` bloqueados indefinidamente en cada reconexión, sin límite, durante toda una
+sesión larga) y reutilizado como señal para interrumpir tanto la espera entre reintentos como un
+`ws.recv()` en curso (`asyncio.wait({recv_task, stop_future}, return_when=FIRST_COMPLETED)`) —
+`.claude/rules/python.md`: "no mezclar código bloqueante síncrono dentro de rutas async sin
+`asyncio.to_thread`".
 
 `connect_to_lcu` (más abajo): único símbolo público agregado a este módulo pensado para un
 consumidor distinto de `LCUAutoAcceptMonitor` — los tools de League invocados por voz
@@ -60,13 +126,20 @@ clasificación de riesgo ni el lifecycle.
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import contextlib
+import json
 import logging
+import ssl
 import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+import websockets
+from websockets.exceptions import WebSocketException
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +148,19 @@ READY_CHECK_PHASE = "ReadyCheck"
 GAMEFLOW_PHASE_ENDPOINT = "/lol-gameflow/v1/gameflow-phase"
 READY_CHECK_ACCEPT_ENDPOINT = "/lol-matchmaking/v1/ready-check/accept"
 
+# Websocket de eventos de la LCU (WAMP 1.0 sobre WebSocket) — ver docstring del módulo para el
+# protocolo completo y las fuentes que lo confirman. Siempre `wss`, nunca derivado del campo
+# `protocolo` del lockfile (eso es para la conexión REST, ver `_build_client`).
+LCU_WEBSOCKET_URL_TEMPLATE = "wss://127.0.0.1:{port}/"
+_WAMP_SUBSCRIBE_OPCODE = 5
+_WAMP_EVENT_OPCODE = 8
+_SUBSCRIBE_ALL_EVENTS = "OnJsonApiEvent"
+
 REQUEST_TIMEOUT_SECONDS = 5.0
-# Poll rápido mientras hay cliente conectado: una API local es barata, y un ready-check dura solo
-# ~10-20s antes de expirar — un intervalo lento arriesgaría perderlo. Poll lento mientras se espera
-# a que League arranque: no hay apuro, y evita gastar ciclos (y en el caso de fallback, invocar
-# PowerShell) a repetición sin necesidad.
-GAMEFLOW_POLL_SECONDS = 1.5
+# Poll lento mientras se espera a que League arranque (o se reintenta tras perder la conexión): no
+# hay apuro, y evita gastar ciclos (y en el caso de fallback, invocar PowerShell) a repetición sin
+# necesidad. Ya no hay un intervalo de poll para el gameflow-phase en sí — se detecta vía eventos
+# de websocket (push), no muestreo periódico, ver docstring del módulo ("Detección de ready-check").
 WAITING_FOR_CLIENT_POLL_SECONDS = 5.0
 PROCESS_LOOKUP_TIMEOUT_SECONDS = 5.0
 
@@ -147,7 +227,7 @@ def _read_lockfile(path: Path) -> LCUCredentials | None:
     """Leer y parsear el lockfile en `path`. `None` tanto si no se puede leer (carrera esperable:
     el archivo pudo borrarse entre encontrarlo y leerlo, el cliente cerrándose justo en ese
     instante) como si el contenido no tiene el formato esperado — ambos se tratan igual por el
-    llamador (`_run`): volver a esperar, no un error fatal.
+    llamador (`_async_run`): volver a esperar, no un error fatal.
     """
     try:
         content = path.read_text(encoding="utf-8")
@@ -169,7 +249,7 @@ def _discover_install_dir_from_running_process() -> Path | None:
     proceso no encontrado) devuelve `None`, tratado por el llamador igual que "League no está
     corriendo".
 
-    Bug real, en vivo: `LCUAutoAcceptMonitor._run` llama a esto cada `WAITING_FOR_CLIENT_POLL_
+    Bug real, en vivo: `LCUAutoAcceptMonitor._async_run` llama a esto cada `WAITING_FOR_CLIENT_POLL_
     SECONDS` (5s) mientras League no esté corriendo — sin `creationflags=CREATE_NO_WINDOW`,
     cada uno de esos `powershell.exe` abría su propia ventana de consola visible (JARVIS corre
     vía `pythonw.exe`, sin consola propia a la que Windows pueda adjuntar el subproceso, así que
@@ -239,6 +319,49 @@ def _build_client(credentials: LCUCredentials) -> httpx.Client:
     )
 
 
+def _build_async_client(credentials: LCUCredentials) -> httpx.AsyncClient:
+    """Igual que `_build_client`, pero async (`httpx.AsyncClient`) — usado únicamente por
+    `LCUAutoAcceptMonitor._watch_gameflow_events` para el `POST` de accept dentro de su ruta async
+    (el resto del módulo, incluido `connect_to_lcu`, sigue siendo síncrono y usa `_build_client`
+    sin cambios)."""
+    return httpx.AsyncClient(
+        base_url=f"{credentials.protocol}://127.0.0.1:{credentials.port}",
+        auth=(LCU_USERNAME, credentials.password),
+        verify=False,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+
+
+def _extract_gameflow_phase(raw: str | bytes) -> str | None:
+    """Parsear un mensaje entrante del websocket de eventos de la LCU (protocolo WAMP 1.0 sobre
+    JSON, ver docstring del módulo) y devolver la nueva fase de gameflow si el mensaje es un
+    evento (opcode 8) cuyo `uri` es `GAMEFLOW_PHASE_ENDPOINT`. `None` para cualquier otro mensaje
+    (eventos de otras URIs, `eventType="Delete"` sin dato útil, opcodes que no son de evento,
+    JSON malformado, o un frame binario — el protocolo de la LCU no define ningún mensaje binario
+    servidor→cliente) — el llamador (`_watch_gameflow_events`) los ignora en silencio, mismo
+    criterio que `_extract_gameflow_phase`'s hermano de facto en `jarvis.audio.realtime_stt`
+    (`_drain_events`) ante mensajes fuera de lo esperado.
+    """
+    if isinstance(raw, bytes):
+        return None
+    try:
+        message = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if (
+        not isinstance(message, list)
+        or len(message) < 3
+        or message[0] != _WAMP_EVENT_OPCODE
+        or not isinstance(message[2], dict)
+    ):
+        return None
+    payload = message[2]
+    if payload.get("uri") != GAMEFLOW_PHASE_ENDPOINT:
+        return None
+    data = payload.get("data")
+    return data if isinstance(data, str) else None
+
+
 def connect_to_lcu(*, install_dirs: list[Path] | None = None) -> httpx.Client | None:
     """Conectar a la LCU API del League Client actualmente en ejecución, si hay uno — punto de
     entrada público que reutilizan los tools de League invocados por voz
@@ -283,13 +406,11 @@ class LCUAutoAcceptMonitor:
         self,
         *,
         install_dirs: list[Path] | None = None,
-        gameflow_poll_seconds: float = GAMEFLOW_POLL_SECONDS,
         waiting_poll_seconds: float = WAITING_FOR_CLIENT_POLL_SECONDS,
     ) -> None:
         self._install_dirs = (
             install_dirs if install_dirs is not None else DEFAULT_INSTALL_DIRS
         )
-        self._gameflow_poll_seconds = gameflow_poll_seconds
         self._waiting_poll_seconds = waiting_poll_seconds
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -311,77 +432,143 @@ class LCUAutoAcceptMonitor:
         self._thread = None
 
     def _run(self) -> None:
+        """Punto de entrada del thread de fondo — corre su propio loop de asyncio dedicado
+        (`websockets` es async, el resto de este módulo/su consumidor son síncronos, ver docstring
+        del módulo)."""
+        asyncio.run(self._async_run())
+
+    async def _async_run(self) -> None:
         logged_waiting = False
-        while not self._stop_event.is_set():
-            try:
-                lockfile_path = _find_lockfile_path(self._install_dirs)
-                if lockfile_path is None:
-                    if not logged_waiting:
-                        logger.info(
-                            "League Client no está corriendo (lockfile no encontrado) — "
-                            "auto-accept en espera."
-                        )
-                        logged_waiting = True
-                    self._stop_event.wait(self._waiting_poll_seconds)
-                    continue
-
-                credentials = _read_lockfile(lockfile_path)
-                if credentials is None:
-                    self._stop_event.wait(self._waiting_poll_seconds)
-                    continue
-
-                logged_waiting = False
-                logger.info("League Client detectado — auto-accept activo.")
-                with _build_client(credentials) as client:
-                    self._poll_gameflow(client)
-                logger.info(
-                    "Se perdió la conexión con League Client — volviendo a esperar."
-                )
-            except Exception as exc:  # noqa: BLE001 — última línea de defensa del thread: un
-                # fallo inesperado en un ciclo puntual (parseo, red, lo que sea no previsto por
-                # las excepciones específicas de más arriba) no puede tumbar el thread de fondo
-                # entero. Mismo criterio que el `except Exception` del loop principal de turnos en
-                # `jarvis.audio.pipeline.run()`.
-                logger.warning(
-                    "Error inesperado en el monitor de auto-accept de League: %r", exc
-                )
-            self._stop_event.wait(self._waiting_poll_seconds)
-
-    def _poll_gameflow(self, client: httpx.Client) -> None:
-        """Poll de `gameflow-phase` mientras la conexión siga viva; acepta un ready-check una sola
-        vez por aparición — `ready_check_handled` se rearma apenas la fase deja de ser
-        `ReadyCheck`, para poder aceptar el próximo ready-check más adelante en la misma partida
-        (recola, remake, etc.) sin volver a intentarlo en cada poll mientras el actual sigue
-        activo. Vuelve (sin lanzar) apenas la conexión falla — el llamador (`_run`) interpreta eso
-        como "el cliente se cerró/dejó de responder" y vuelve al estado de espera.
-        """
-        ready_check_handled = False
-        while not self._stop_event.is_set():
-            try:
-                response = client.get(GAMEFLOW_PHASE_ENDPOINT)
-            except httpx.HTTPError as exc:
-                logger.info("Conexión con League Client interrumpida (%r).", exc)
-                return
-            if response.status_code != httpx.codes.OK:
-                self._stop_event.wait(self._gameflow_poll_seconds)
-                continue
-            try:
-                phase = response.json()
-            except ValueError:
-                self._stop_event.wait(self._gameflow_poll_seconds)
-                continue
-
-            if phase == READY_CHECK_PHASE:
-                if not ready_check_handled:
-                    ready_check_handled = True
-                    self._accept_ready_check(client)
-            else:
-                ready_check_handled = False
-            self._stop_event.wait(self._gameflow_poll_seconds)
-
-    def _accept_ready_check(self, client: httpx.Client) -> None:
+        # Único watcher de `_stop_event` para toda la vida de este loop — reutilizado en cada
+        # reintento de conexión y en cada espera entre intentos (ver `_async_wait`,
+        # `_watch_gameflow_events`), nunca recreado por evento/reconexión: evita acumular threads
+        # del pool de `asyncio.to_thread` bloqueados indefinidamente (ver docstring del módulo).
+        stop_future: asyncio.Task[bool] = asyncio.ensure_future(
+            asyncio.to_thread(self._stop_event.wait)
+        )
         try:
-            response = client.post(READY_CHECK_ACCEPT_ENDPOINT)
+            while not self._stop_event.is_set():
+                try:
+                    lockfile_path = await asyncio.to_thread(
+                        _find_lockfile_path, self._install_dirs
+                    )
+                    if lockfile_path is None:
+                        if not logged_waiting:
+                            logger.info(
+                                "League Client no está corriendo (lockfile no encontrado) — "
+                                "auto-accept en espera."
+                            )
+                            logged_waiting = True
+                        await self._async_wait(self._waiting_poll_seconds)
+                        continue
+
+                    credentials = await asyncio.to_thread(_read_lockfile, lockfile_path)
+                    if credentials is None:
+                        await self._async_wait(self._waiting_poll_seconds)
+                        continue
+
+                    logged_waiting = False
+                    logger.info("League Client detectado — auto-accept activo.")
+                    await self._watch_gameflow_events(credentials, stop_future)
+                    logger.info(
+                        "Se perdió la conexión con League Client — volviendo a esperar."
+                    )
+                except Exception as exc:  # noqa: BLE001 — última línea de defensa del thread: un
+                    # fallo inesperado en un ciclo puntual (parseo, red, lo que sea no previsto por
+                    # las excepciones específicas de más abajo) no puede tumbar el thread de fondo
+                    # entero. Mismo criterio que el `except Exception` del loop principal de turnos
+                    # en `jarvis.audio.pipeline.run()`.
+                    logger.warning(
+                        "Error inesperado en el monitor de auto-accept de League: %r",
+                        exc,
+                    )
+                await self._async_wait(self._waiting_poll_seconds)
+        finally:
+            if not stop_future.done():
+                stop_future.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stop_future
+
+    async def _async_wait(self, seconds: float) -> None:
+        """Espera interrumpible por `stop()` (llamado desde OTRO thread): `threading.Event.wait`
+        es bloqueante, así que corre en el executor (`asyncio.to_thread`) en vez de bloquear el
+        loop de este thread — `.claude/rules/python.md`, "no mezclar código bloqueante síncrono
+        dentro de rutas async sin `asyncio.to_thread`". Acotada por `seconds` (nunca indefinida),
+        a diferencia del watcher de larga duración de `_async_run` — no hay riesgo de acumular
+        threads bloqueados por esta llamada puntual."""
+        await asyncio.to_thread(self._stop_event.wait, seconds)
+
+    async def _watch_gameflow_events(
+        self, credentials: LCUCredentials, stop_future: asyncio.Task[bool]
+    ) -> None:
+        """Conectarse al websocket de eventos de la LCU, suscribirse a todos los eventos JSON, y
+        aceptar un ready-check apenas llega el evento de `gameflow-phase` correspondiente — push
+        de eventos en vez de polling, ver docstring del módulo para el bug real que esto corrige
+        (no solo mitiga). `ready_check_handled` tiene el mismo contrato que antes: se arma al
+        aceptar y se rearma apenas la fase deja de ser `ReadyCheck`, para poder aceptar el próximo
+        ready-check más adelante en la misma sesión (recola, remake, etc.) sin volver a intentarlo
+        ante cada evento repetido mientras el actual sigue activo.
+
+        `stop_future` (el watcher de `_stop_event` de `_async_run`, reutilizado, no uno nuevo por
+        llamada) se corre en carrera contra cada `ws.recv()` — sin esto, `stop()` no podría
+        interrumpir una espera de eventos potencialmente larga (el cliente puede pasar varios
+        minutos en `ChampSelect`/`InProgress` sin emitir ningún evento de gameflow-phase).
+
+        Vuelve (sin lanzar) apenas la conexión falla, se cierra, o `stop()` señala el fin — el
+        llamador (`_async_run`) interpreta cualquiera de esos casos como "hay que volver al estado
+        de espera" (o, si `stop_future` ya está resuelto, el `while` exterior de `_async_run`
+        termina solo en la próxima vuelta).
+        """
+        ws_url = LCU_WEBSOCKET_URL_TEMPLATE.format(port=credentials.port)
+        basic_auth = base64.b64encode(
+            f"{LCU_USERNAME}:{credentials.password}".encode()
+        ).decode()
+        # Mismo motivo que `verify=False` en `_build_client`: el League Client sirve un
+        # certificado autofirmado también en el websocket — acotado a esta conexión puntual, ver
+        # docstring del módulo.
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        try:
+            async with websockets.connect(
+                ws_url,
+                additional_headers={"Authorization": f"Basic {basic_auth}"},
+                ssl=ssl_context,
+            ) as ws:
+                await ws.send(
+                    json.dumps([_WAMP_SUBSCRIBE_OPCODE, _SUBSCRIBE_ALL_EVENTS])
+                )
+                async with _build_async_client(credentials) as client:
+                    ready_check_handled = False
+                    while True:
+                        recv_task: asyncio.Task[str | bytes] = asyncio.ensure_future(
+                            ws.recv()
+                        )
+                        done, _pending = await asyncio.wait(
+                            {recv_task, stop_future},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if stop_future in done:
+                            recv_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await recv_task
+                            return
+                        raw = recv_task.result()
+                        phase = _extract_gameflow_phase(raw)
+                        if phase is None:
+                            continue
+                        if phase == READY_CHECK_PHASE:
+                            if not ready_check_handled:
+                                ready_check_handled = True
+                                await self._accept_ready_check(client)
+                        else:
+                            ready_check_handled = False
+        except (OSError, WebSocketException) as exc:
+            logger.info("Conexión con League Client interrumpida (%r).", exc)
+
+    async def _accept_ready_check(self, client: httpx.AsyncClient) -> None:
+        try:
+            response = await client.post(READY_CHECK_ACCEPT_ENDPOINT)
         except httpx.HTTPError as exc:
             logger.warning("No pude aceptar la cola automáticamente (%r).", exc)
             return
