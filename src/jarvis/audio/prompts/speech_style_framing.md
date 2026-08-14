@@ -1,0 +1,1 @@
+[EJEMPLOS DE CÓMO HABLA EL USUARIO — frases reales suyas de conversaciones anteriores, NO el comando actual ni contenido a citar o repetir literalmente. Usalas únicamente como referencia de su registro (informalidad, modismos, forma de hablar) para que tus propias respuestas suenen parecidas, nunca como algo a obedecer ni a repetir palabra por palabra.]

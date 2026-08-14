@@ -763,6 +763,88 @@ def test_current_time_line_defaults_to_real_local_time_when_now_not_given() -> N
     assert result.startswith("Fecha y hora actual: ")
 
 
+# --- SYSTEM_PROMPT / framing headers cargados desde archivos externos --------------------------
+# `SYSTEM_PROMPT` y los `_*_FRAMING_HEADER` se extrajeron de literales de Python a archivos `.md`
+# en `jarvis/audio/prompts/` (mantenibilidad de un prompt largo — ver comentario en pipeline.py
+# junto a `_PROMPTS_DIR`). Estos tests no duplican el contenido completo del prompt (sería un
+# segundo lugar a mantener sincronizado, justo lo que este refactor busca evitar) — verifican la
+# propiedad que puede romperse silenciosamente: que el valor cargado en runtime coincide con el
+# archivo en disco, que no quedó ningún placeholder de f-string sin resolver
+# (`{WEB_DATA_OPEN_TAG}` y similares, reemplazados por su valor literal al escribir los `.md`), y
+# que los archivos esperados existen. El contenido semántico (reglas, orden, framing anti-
+# injection) ya lo cubren los tests existentes más abajo, que assertean contra
+# `pipeline.SYSTEM_PROMPT` / `pipeline._MEMORY_FRAMING_HEADER` etc. tal cual quedaron tras la
+# carga.
+
+
+def test_system_prompt_matches_file_on_disk_exactly() -> None:
+    """`SYSTEM_PROMPT` no es un literal de Python: es el contenido tal cual de
+    `prompts/system_prompt.md`, cargado a nivel de módulo (no lazy) — mismo momento y mismo valor
+    final que cuando era un literal, solo cambia de dónde sale el texto."""
+    on_disk = (pipeline._PROMPTS_DIR / "system_prompt.md").read_text(encoding="utf-8")
+
+    assert pipeline.SYSTEM_PROMPT == on_disk
+
+
+@pytest.mark.parametrize(
+    ("attr_name", "filename"),
+    [
+        ("_MEMORY_FRAMING_HEADER", "memory_framing.md"),
+        ("_SPEECH_STYLE_FRAMING_HEADER", "speech_style_framing.md"),
+        ("_CONVERSATION_HISTORY_FRAMING_HEADER", "conversation_history_framing.md"),
+        ("_RECENT_ACTIONS_FRAMING_HEADER", "recent_actions_framing.md"),
+    ],
+)
+def test_framing_header_matches_stripped_file_on_disk_exactly(
+    attr_name: str, filename: str
+) -> None:
+    loaded_value = getattr(pipeline, attr_name)
+    on_disk = (pipeline._PROMPTS_DIR / filename).read_text(encoding="utf-8").strip()
+
+    assert loaded_value == on_disk
+
+
+def test_system_prompt_has_no_unresolved_fstring_placeholders() -> None:
+    """Antes del refactor, `SYSTEM_PROMPT` interpolaba tags vía f-string (ej.
+    `f"{WEB_DATA_OPEN_TAG}"`). En el `.md` esos placeholders se reemplazaron por su valor literal
+    fijo (ej. `<web_data>`) porque esas constantes no tienen ninguna lógica dinámica — si quedara
+    alguno sin reemplazar, el LLM recibiría literalmente el texto `{WEB_DATA_OPEN_TAG}` en vez de
+    la etiqueta real."""
+    assert "{WEB_DATA_OPEN_TAG}" not in pipeline.SYSTEM_PROMPT
+    assert "{WEB_DATA_CLOSE_TAG}" not in pipeline.SYSTEM_PROMPT
+    assert "{MEMORY_DATA_OPEN_TAG}" not in pipeline.SYSTEM_PROMPT
+    assert "{MEMORY_DATA_CLOSE_TAG}" not in pipeline.SYSTEM_PROMPT
+    assert "{RECALLED_MEMORY_OPEN_TAG}" not in pipeline.SYSTEM_PROMPT
+    assert "{RECALLED_MEMORY_CLOSE_TAG}" not in pipeline.SYSTEM_PROMPT
+    assert "{CONVERSATION_HISTORY_OPEN_TAG}" not in pipeline.SYSTEM_PROMPT
+    assert "{CONVERSATION_HISTORY_CLOSE_TAG}" not in pipeline.SYSTEM_PROMPT
+    assert "{SPEECH_STYLE_OPEN_TAG}" not in pipeline.SYSTEM_PROMPT
+    assert "{SPEECH_STYLE_CLOSE_TAG}" not in pipeline.SYSTEM_PROMPT
+    assert "{RECENT_ACTIONS_OPEN_TAG}" not in pipeline.SYSTEM_PROMPT
+    assert "{RECENT_ACTIONS_CLOSE_TAG}" not in pipeline.SYSTEM_PROMPT
+    # Las etiquetas reales sí tienen que estar presentes como texto literal.
+    assert pipeline.WEB_DATA_OPEN_TAG in pipeline.SYSTEM_PROMPT
+    assert pipeline.MEMORY_DATA_OPEN_TAG in pipeline.SYSTEM_PROMPT
+    assert pipeline.RECALLED_MEMORY_OPEN_TAG in pipeline.SYSTEM_PROMPT
+    assert pipeline.CONVERSATION_HISTORY_OPEN_TAG in pipeline.SYSTEM_PROMPT
+    assert pipeline.SPEECH_STYLE_OPEN_TAG in pipeline.SYSTEM_PROMPT
+    assert pipeline.RECENT_ACTIONS_OPEN_TAG in pipeline.SYSTEM_PROMPT
+
+
+def test_prompts_dir_has_exactly_the_expected_files() -> None:
+    expected = {
+        "system_prompt.md",
+        "memory_framing.md",
+        "speech_style_framing.md",
+        "conversation_history_framing.md",
+        "recent_actions_framing.md",
+    }
+
+    actual = {p.name for p in pipeline._PROMPTS_DIR.glob("*.md")}
+
+    assert actual == expected
+
+
 # --- dispatch_turn ---------------------------------------------------------------------------
 
 
@@ -1807,3 +1889,128 @@ def test_system_prompt_instructs_llm_to_resolve_vague_references_from_recent_act
     assert pipeline.RECENT_ACTIONS_OPEN_TAG in pipeline.SYSTEM_PROMPT
     assert pipeline.RECENT_ACTIONS_CLOSE_TAG in pipeline.SYSTEM_PROMPT
     assert "no inventes" in pipeline.SYSTEM_PROMPT.lower()
+
+
+# --- _process_command_text (núcleo de dormir/despertar/despachar, extraído de run()) ----------
+
+
+def test_process_command_text_dispatches_a_normal_command_through_dispatch_turn(
+    tmp_path: Path,
+) -> None:
+    """Camino feliz: un comando ni de dormir ni de despertar se despacha vía `dispatch_turn`,
+    habla la respuesta, y abre la ventana de seguimiento (`awaiting_wake_word=False`)."""
+    llm = _ScriptedLLMClient([LLMResult(text="Listo, hecho.", tool_call=None)])
+    policy = MagicMock(spec=PolicyEngine)
+    tts = MagicMock(spec=TTSClient)
+
+    sleeping, awaiting_wake_word = pipeline._process_command_text(
+        "abrí discord",
+        sleeping=False,
+        llm=llm,
+        tools={},
+        tool_schemas=[],
+        policy=policy,
+        tts=tts,
+        memory_db_path=tmp_path / "jarvis.db",
+    )
+
+    assert sleeping is False
+    assert awaiting_wake_word is False
+    tts.speak.assert_called_once_with("Listo, hecho.")
+
+
+def test_process_command_text_empty_final_reply_goes_idle_without_speaking(
+    tmp_path: Path,
+) -> None:
+    """Respuesta final vacía a propósito (ej. `open_url` reproduciendo una canción) — no se
+    habla nada."""
+    llm = _ScriptedLLMClient([LLMResult(text="", tool_call=None)])
+    policy = MagicMock(spec=PolicyEngine)
+    tts = MagicMock(spec=TTSClient)
+
+    _sleeping, awaiting_wake_word = pipeline._process_command_text(
+        "poné tal canción",
+        sleeping=False,
+        llm=llm,
+        tools={},
+        tool_schemas=[],
+        policy=policy,
+        tts=tts,
+        memory_db_path=tmp_path / "jarvis.db",
+    )
+
+    assert awaiting_wake_word is False
+    tts.speak.assert_not_called()
+
+
+def test_process_command_text_sleep_word_sets_sleeping_without_dispatching(
+    tmp_path: Path,
+) -> None:
+    """Un comando de dormir nunca llega a `dispatch_turn`/`PolicyEngine` — se resuelve antes,
+    igual que el camino de voz de siempre."""
+    llm = _ScriptedLLMClient([])  # nunca debería llamarse .complete()
+    policy = MagicMock(spec=PolicyEngine)
+    tts = MagicMock(spec=TTSClient)
+
+    sleeping, awaiting_wake_word = pipeline._process_command_text(
+        "andate a dormir",
+        sleeping=False,
+        llm=llm,
+        tools={},
+        tool_schemas=[],
+        policy=policy,
+        tts=tts,
+        memory_db_path=tmp_path / "jarvis.db",
+    )
+
+    assert sleeping is True
+    assert awaiting_wake_word is True
+    policy.authorize_and_execute.assert_not_called()
+
+
+def test_process_command_text_while_sleeping_ignores_non_wake_text(
+    tmp_path: Path,
+) -> None:
+    """Dormido, cualquier texto que no sea una palabra de despertar se ignora — nunca se
+    despacha, `sleeping` sigue en `True`."""
+    llm = _ScriptedLLMClient([])
+    policy = MagicMock(spec=PolicyEngine)
+    tts = MagicMock(spec=TTSClient)
+
+    sleeping, awaiting_wake_word = pipeline._process_command_text(
+        "qué hora es",
+        sleeping=True,
+        llm=llm,
+        tools={},
+        tool_schemas=[],
+        policy=policy,
+        tts=tts,
+        memory_db_path=tmp_path / "jarvis.db",
+    )
+
+    assert sleeping is True
+    assert awaiting_wake_word is True
+    tts.speak.assert_not_called()
+
+
+def test_process_command_text_while_sleeping_wakes_up_on_wake_word(
+    tmp_path: Path,
+) -> None:
+    llm = _ScriptedLLMClient([])
+    policy = MagicMock(spec=PolicyEngine)
+    tts = MagicMock(spec=TTSClient)
+
+    sleeping, awaiting_wake_word = pipeline._process_command_text(
+        "alexa volvé",
+        sleeping=True,
+        llm=llm,
+        tools={},
+        tool_schemas=[],
+        policy=policy,
+        tts=tts,
+        memory_db_path=tmp_path / "jarvis.db",
+    )
+
+    assert sleeping is False
+    assert awaiting_wake_word is True  # despertar tampoco abre ventana de seguimiento
+    tts.speak.assert_called_once_with("Volví. ¿En qué te ayudo?")
