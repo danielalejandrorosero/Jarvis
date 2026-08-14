@@ -17,9 +17,10 @@ Dos formas de ajustar el volumen, según lo que pida el usuario:
   equivalente en stdlib. Se usa `pycaw` (dependencia nueva, ver `pyproject.toml`), la librería
   estándar y ampliamente usada del ecosistema Python-Windows específicamente para envolver esta
   API de Core Audio (evita escribir a mano el boilerplate de interfaces COM/`comtypes` que ya
-  resuelve `pycaw`); `comtypes` (que `pycaw` usa por debajo) ya era una dependencia transitiva
-  existente en este repo (vía `pyttsx3`), así que el costo real incremental es solo `pycaw` en sí,
-  una librería chica y de un único propósito.
+  resuelve `pycaw`); `comtypes` es una dependencia transitiva directa de `pycaw` (lo declara en
+  sus propios requisitos), no algo a justificar aparte, y `psutil` (la otra dependencia de
+  `pycaw`) ya estaba en este repo por `jarvis.tools.system_info` — el costo real incremental es
+  solo `pycaw` en sí, una librería chica y de un único propósito.
 
 `level` tiene precedencia sobre `action` cuando ambos vienen presentes en la misma llamada (no
 debería pasar en la práctica — el LLM elige uno u otro según el pedido — pero definir un orden

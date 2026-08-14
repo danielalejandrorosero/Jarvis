@@ -213,11 +213,11 @@ class TimerScheduler:
             else:
                 message = "¡Se cumplió tu timer!"
             # Anunciar ANTES de descartar el timer de la lista en memoria — mismo orden que
-            # `_announce_due_reminders` con `delete_reminder`: si `tts.speak()` lanzara (no
-            # debería — `FallbackTTSClient` está diseñado para nunca propagar, ver
-            # `jarvis.audio.tts` — pero si algún día un `TTSClient` custom lo hiciera), es
-            # preferible reintentar el anuncio en el próximo poll a perder el timer sin haberlo
-            # dicho nunca.
+            # `_announce_due_reminders` con `delete_reminder`: `tts.speak()` puede lanzar de
+            # verdad en el camino normal (sin fallback local, ver `jarvis.audio.tts`/ADR-0011, un
+            # fallo de la API de OpenAI se propaga tal cual), y `_run()` más abajo atrapa esa
+            # excepción a nivel de poll — es preferible reintentar el anuncio en el próximo poll a
+            # perder el timer sin haberlo dicho nunca.
             self._tts.speak(message)
             with self._lock:
                 self._timers = [t for t in self._timers if t.id != timer.id]

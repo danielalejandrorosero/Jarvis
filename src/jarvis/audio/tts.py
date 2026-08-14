@@ -1,16 +1,19 @@
-"""Texto a voz detrás de una interfaz swappable (ADR-0004).
+"""Texto a voz detrás de una interfaz swappable.
 
-Primario: API de OpenAI (`gpt-4o-mini-tts`) — mismo proveedor que ya usamos para STT (misma
-`OPENAI_API_KEY`, sin cuenta nueva). Reemplaza a `edge-tts` (medido en vivo: generación de
-~8.7s en una respuesta corta, el cuello de botella real de latencia de todo el pipeline —
-`edge-tts` es un endpoint no oficial de Microsoft, sin garantía de rendimiento). Fallback local
-obligatorio: SAPI vía `pyttsx3`, siempre disponible en Windows, sin red — JARVIS nunca queda
-mudo por depender de algo externo, sea cual sea el primario.
+Default: SAPI local vía `pyttsx3` (ADR-0013, revierte ADR-0011 sobre cuál es el default —
+ADR-0011 sigue vigente en la parte que importa: nunca hay un fallback en cascada, un solo
+`TTSClient` a la vez, sin degradación silenciosa a mitad de turno). Motivo del cambio: en uso
+real, la API de OpenAI (`gpt-4o-mini-tts`, la voz "bonita") depende de crédito de cuenta que se
+agotó más de una vez y dejó a JARVIS completamente mudo — y el usuario, en vivo, dijo
+explícitamente que no le importa la calidad de la voz ("para qué quiero que me hablen bonito"),
+que lo que sí le importa es que el transcriptor (STT) entienda bien, ya resuelto aparte
+(Speechmatics, ADR-0012). SAPI es local, gratis, sin red ni cuenta — nunca depende de crédito
+externo. `OpenAITTSClient` se deja definida (interfaz `TTSClient` sigue siendo swappable a
+propósito) por si en el futuro se quiere volver a la voz neural, pero no es el default.
 """
 
 from __future__ import annotations
 
-import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -78,7 +81,8 @@ class OpenAITTSClient:
 
 
 class SapiTTSClient:
-    """Fallback local: SAPI vía `pyttsx3`. Siempre disponible en Windows, sin red ni dependencia externa."""
+    """Voz local de Windows vía SAPI (`pyttsx3`) — sin red, sin cuenta, sin crédito que se pueda
+    agotar. Default desde ADR-0013 (ver docstring del módulo)."""
 
     def speak(self, text: str) -> None:
         engine = pyttsx3.init()
@@ -86,33 +90,11 @@ class SapiTTSClient:
         engine.runAndWait()
 
 
-class FallbackTTSClient:
-    """Intenta el primario; si falla por lo que sea, cae al fallback local.
-
-    Excepción amplia deliberada: esta es exactamente la "capa de recuperación explícitamente
-    documentada" que `.claude/rules/python.md` permite como excepción a "nunca except Exception
-    silencioso" — es el punto central del contrato de ADR-0004 (nunca mudo). No silenciosa del
-    todo: avisa por stderr cuándo cayó al fallback, para que el fallo del primario sea visible
-    aunque no sea fatal.
-    """
-
-    def __init__(self, *, primary: TTSClient, fallback: TTSClient) -> None:
-        self._primary = primary
-        self._fallback = fallback
-
-    def speak(self, text: str) -> None:
-        try:
-            self._primary.speak(text)
-        except Exception as exc:  # noqa: BLE001 — fallback documentado (ADR-0004), no descuido
-            print(
-                f"TTS primario falló ({exc!r}), usando fallback local.", file=sys.stderr
-            )
-            self._fallback.speak(text)
-
-
 def load_default_tts_client() -> TTSClient:
-    """Cliente TTS con el contrato de ADR-0004: OpenAI TTS primario, SAPI de fallback."""
-    return FallbackTTSClient(primary=OpenAITTSClient(), fallback=SapiTTSClient())
+    """Cliente TTS por defecto: `SapiTTSClient` (ADR-0013) — local, gratis, nunca depende de
+    crédito externo. `OpenAITTSClient` sigue disponible como alternativa swappable, no es el
+    default."""
+    return SapiTTSClient()
 
 
 class LockingTTSClient:
@@ -126,25 +108,23 @@ class LockingTTSClient:
     thread de fondo genuinamente independiente que puede llamar `tts.speak()` en cualquier
     momento, incluso mientras el loop principal está a mitad de decir otra cosa.
 
-    No hay evidencia concreta de que las implementaciones de `TTSClient` de este módulo se rompan
-    con llamadas concurrentes (`OpenAITTSClient.speak` escribe a un archivo temporal *propio* por
-    llamada — `tempfile.TemporaryDirectory()` por invocación, sin colisión de paths — y
-    `playsound3.playsound()` bloquea hasta terminar su propia reproducción; probablemente ambas
-    llamadas simplemente reproducirían audio superpuesto en vez de fallar). El riesgo real y
-    concreto es distinto: `SapiTTSClient.speak()` crea un `pyttsx3.init()` nuevo por llamada, y
-    SAPI vía COM en Windows no está garantizado thread-safe sin inicialización explícita de
-    apartment por thread — dos `speak()` concurrentes cayendo al fallback local podrían
-    interferir entre sí de formas no obvias. Sin haber podido confirmar esto en vivo (haría falta
-    forzar el fallback dos veces en simultáneo), este wrapper es la mitigación barata: un lock
-    global sobre la reproducción real hace que "concurrente" se convierta en "en cola, uno
-    después del otro" — nunca simultáneo — a costo de que un anuncio de timer/recordatorio pueda
-    esperar a que termine de hablar lo que esté sonando en ese momento, que es exactamente el
-    comportamiento esperado (dos voces superpuestas serían peor experiencia que una cola corta).
+    Riesgo real y concreto con el default actual (`SapiTTSClient`, ADR-0013): crea un
+    `pyttsx3.init()` nuevo por llamada, y SAPI vía COM en Windows no está garantizado thread-safe
+    sin inicialización explícita de apartment por thread — dos `speak()` concurrentes cayendo en
+    SAPI podrían interferir entre sí de formas no obvias. Sin haber podido confirmar esto en vivo
+    (haría falta forzar dos llamadas simultáneas), este wrapper es la mitigación barata: un lock
+    global sobre la reproducción real hace que "concurrente" se convierta en "en cola, uno después
+    del otro" — nunca simultáneo — a costo de que un anuncio de timer/recordatorio pueda esperar a
+    que termine de hablar lo que esté sonando en ese momento, que es exactamente el comportamiento
+    esperado (dos voces superpuestas serían peor experiencia que una cola corta). Si el default
+    volviera a `OpenAITTSClient` en el futuro, el riesgo es menor pero no nulo (escribe a un
+    archivo temporal *propio* por llamada, sin colisión de paths, pero `playsound3.playsound()` no
+    documenta explícitamente ser reentrante) — el lock se queda de cualquier forma, no es
+    específico de un solo `TTSClient`.
 
     Usado en `jarvis.audio.pipeline.run()` envolviendo el `TTSClient` que ya devuelve
-    `load_default_tts_client()` — nunca cambia el tipo que devuelve esa función (no rompe
-    `test_load_default_tts_client_returns_a_fallback_tts_client`), la envoltura se aplica en el
-    punto de uso.
+    `load_default_tts_client()` — nunca cambia el tipo que devuelve esa función, la envoltura se
+    aplica en el punto de uso.
     """
 
     def __init__(self, *, inner: TTSClient, lock: threading.Lock | None = None) -> None:
