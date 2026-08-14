@@ -12,6 +12,7 @@ import sys
 import time
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 import sounddevice as sd
@@ -20,6 +21,7 @@ from openwakeword.model import Model
 from jarvis.audio.device import input_sample_rate, resolve_input_device
 from jarvis.audio.loopback import SystemAudioGate
 from jarvis.audio.resample import fit_frame, resample
+from jarvis.audio.speech_detector import SPEECH_PROBABILITY_THRESHOLD
 
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1280  # 80ms a 16kHz: tamaño de chunk recomendado por openWakeWord
@@ -57,6 +59,16 @@ class Detection:
     wakeword: str
     score: float
     timestamp: dt.datetime
+
+
+class SpeechDetector(Protocol):
+    """Contrato mínimo que `detect()` necesita de un detector de voz (Silero VAD,
+    `jarvis.audio.speech_detector.ChunkSpeechDetector`) — mismo espíritu que `SystemAudioGate`
+    (`jarvis.audio.loopback`): tipar el parámetro sin acoplar `detect()` a cargar un modelo real
+    ni abrir ningún recurso en sus tests, un fake que solo implementa `speech_probability` alcanza.
+    """
+
+    def speech_probability(self, chunk_int16: np.ndarray) -> float: ...
 
 
 def load_model() -> Model:
@@ -112,6 +124,8 @@ def detect(
     model: Model,
     threshold: float = DEFAULT_THRESHOLD,
     system_audio: SystemAudioGate | None = None,
+    speech_detector: SpeechDetector | None = None,
+    speech_probability_threshold: float = SPEECH_PROBABILITY_THRESHOLD,
 ) -> Iterator[Detection]:
     """Consumir frames de audio y emitir una Detection cada vez que se cruza el umbral.
 
@@ -124,10 +138,56 @@ def detect(
     saltear frames enteros rompería las predicciones siguientes en vez de solo silenciarlas.
     Sin `system_audio` (default `None`, como en todos los tests existentes), el comportamiento
     es idéntico al de antes de este parámetro.
+
+    `speech_detector` (opcional, `jarvis.audio.speech_detector.ChunkSpeechDetector` vía
+    `load_speech_detector()`) cierra un hueco real de `system_audio`: confirmado en vivo
+    (`data/jarvis-error.log`, sesión del 2026-08-13, ~20:13-20:15) — con el mic y la salida
+    siendo el mismo headset combinado, `SystemAudioMonitor` desactiva el gate por completo
+    (`device.is_combined_headset`, asumiendo que un headset no tiene filtración acústica real de
+    salida a entrada), pero en este hardware SÍ la hay: mientras sonaba música/video de fondo
+    (YouTube, abierto por un turno anterior — "te abrí YouTube en el navegador"/"reproduce Space
+    Zone en YouTube"), el wake word se disparó solo, repetidamente, con score=1.00, cada vez que
+    se reabría una ventana de escucha — sin que el usuario dijera nada (`Dijiste: ''` en
+    `data/jarvis.log` en cada ciclo) y sin que JARVIS estuviera hablando (`tts.speak()` no se
+    llamó ninguna vez en ese tramo). El RMS medido en esos ciclos (`data/jarvis-error.log`, los
+    primeros chunks de `record_command` justo después de cada disparo falso) se quedó bajo
+    (~5-300, muy por debajo del rango de voz real medido en esta sesión, 300-9000) — consistente
+    con audio de sistema filtrándose bajito al mic (sea acústicamente o vía sidetone de hardware
+    del propio headset), no con el usuario hablando fuerte cerca del mic. Ni "pausar mientras
+    `tts.speak()` está activo" ni "umbral más alto justo después de abrir una URL" (los dos
+    candidatos evaluados antes de este) cubren este caso: el audio de fondo sigue sonando minutos
+    después de abrirse la URL, mucho más allá de cualquier ventana transitoria razonable, y JARVIS
+    no estaba hablando en ningún momento del tramo con falsos triggers.
+    En vez de tocar `loopback.py`/`is_combined_headset` (revertir el gate a "siempre activo"
+    reintroduciría el bug que motivó la excepción de headset en primer lugar: `SystemAudioMonitor`
+    calibrado contra el nivel del loopback de SALIDA, no de lo que se filtra al mic, reportaba
+    `is_loud()=True` casi todo el tiempo con juego/música de fondo y bloqueaba el wake word por
+    completo incluso diciendo "Alexa" activamente — cambiar ese trade-off es una decisión de
+    producto, no algo a decidir de forma incidental acá), este chequeo es independiente y
+    ortogonal: usa `jarvis.audio.speech_detector` (Silero VAD), el mismo discriminador "¿esto
+    suena a voz humana o no?" que ya filtra ruido de juego en `record_command`/
+    `stream_transcribe_command` (`jarvis.audio.vad.is_speech_chunk`) — acá se aplica en el único
+    punto del pipeline de audio que todavía no lo tenía. Igual que `system_audio`, se llama a
+    `speech_probability()` en CADA frame sin importar el resultado de las otras gates: mantiene el
+    buffer interno del detector sincronizado con el audio real (saltear frames lo desalinearía).
+    Sin `speech_detector` (default `None`, como en todos los tests existentes salvo los que lo
+    inyectan explícitamente), el comportamiento es idéntico al de antes de este parámetro — mismo
+    criterio de degradación que `is_speech_chunk` con `speech_probability=None`: una mejora
+    opcional que no tumba la detección si el modelo no cargó.
     """
     for frame in frames:
         predictions = model.predict(frame)
+        speech_probability = (
+            speech_detector.speech_probability(frame)
+            if speech_detector is not None
+            else None
+        )
         if system_audio is not None and system_audio.is_loud():
+            continue
+        if (
+            speech_probability is not None
+            and speech_probability < speech_probability_threshold
+        ):
             continue
         for wakeword, score in predictions.items():
             if score >= threshold:

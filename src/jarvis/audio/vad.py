@@ -32,8 +32,20 @@ from __future__ import annotations
 import numpy as np
 
 TRAILING_SILENCE_SECONDS = (
-    1.2  # cuánto silencio sostenido después de hablar antes de cortar solo
+    0.7  # cuánto silencio sostenido después de hablar antes de cortar solo
 )
+# Bajado de 1.2 a 0.7 (investigación real, con fuentes, no una corazonada): 1.2s está por
+# encima de lo que la industria recomienda para voice AI conversacional — Speechmatics (el
+# proveedor de STT al que se migra, ver ADR-0012) recomienda explícitamente 0.5-0.8s para este
+# caso de uso (reservan 2.4s+ como piso de seguridad para el peor caso, no como valor normal).
+# Pedido explícito del usuario tras señalar el tiempo de corte de turno como el otro cuello de
+# botella percibido, además del proveedor de STT en sí. Sujeto a ajuste empírico: si en uso real
+# aparecen cortes a mitad de frase con más frecuencia que antes, subir de nuevo hacia 1.0-1.2;
+# la alternativa "correcta" (VAD semántico, umbral variable por frase en vez de fijo) se evaluó
+# y se descartó por ahora — ver investigación de esta sesión: el candidato local más serio
+# (LiveKit turn-detector) no es un import directo (atado a su propio framework) y rinde peor en
+# español que en inglés en su propio benchmark: no vale la complejidad todavía frente a este
+# ajuste simple de config.
 
 
 def chunk_rms(chunk: np.ndarray) -> float:

@@ -214,3 +214,94 @@ def test_detect_calls_predict_even_on_frames_suppressed_by_system_audio() -> Non
     )
 
     assert hits == []
+
+
+# --- speech_detector (gate de falsos triggers por audio de sistema NO fuerte que igual se cuela
+# al mic, ej. headset combinado con `SystemAudioMonitor` desactivado — ver docstring de `detect`) -
+
+
+class _FakeSpeechDetector:
+    """Stub de `wake_word.SpeechDetector`: `speech_probability()` devuelve un valor fijo, sin
+    cargar ningún modelo Silero real — cumple el contrato mínimo que `detect()` necesita."""
+
+    def __init__(self, *, probability: float) -> None:
+        self._probability = probability
+        self.calls = 0
+
+    def speech_probability(self, chunk_int16: np.ndarray) -> float:
+        self.calls += 1
+        return self._probability
+
+
+def test_detect_suppresses_detection_when_speech_probability_is_low() -> None:
+    """Un score que normalmente cruzaría el umbral no produce Detection si `speech_detector`
+    reporta una probabilidad de voz por debajo de `speech_probability_threshold` — el caso real
+    confirmado en vivo (`data/jarvis-error.log`): audio de fondo (música/video) filtrándose al mic
+    de un headset combinado, con el gate de `system_audio` desactivado para ese caso."""
+    frames = _silence_frames(1)
+    model = _model_with([{"hey_jarvis": 0.9}])
+
+    hits = list(
+        detect(
+            frames,
+            model=model,
+            threshold=0.5,
+            speech_detector=_FakeSpeechDetector(probability=0.1),
+            speech_probability_threshold=0.5,
+        )
+    )
+
+    assert hits == []
+
+
+def test_detect_still_yields_detection_when_speech_probability_is_high() -> None:
+    """Con el detector presente pero reportando probabilidad alta (voz real), el comportamiento
+    es el de siempre."""
+    frames = _silence_frames(1)
+    model = _model_with([{"hey_jarvis": 0.9}])
+
+    hits = list(
+        detect(
+            frames,
+            model=model,
+            threshold=0.5,
+            speech_detector=_FakeSpeechDetector(probability=0.9),
+            speech_probability_threshold=0.5,
+        )
+    )
+
+    assert len(hits) == 1
+    assert hits[0].score == 0.9
+
+
+def test_detect_without_speech_detector_behaves_as_before() -> None:
+    """Sin `speech_detector` (default `None`), el comportamiento es idéntico al de antes de este
+    parámetro — una mejora opcional nunca tumba la detección si no se inyecta."""
+    frames = _silence_frames(1)
+    model = _model_with([{"hey_jarvis": 0.9}])
+
+    hits = list(detect(frames, model=model, threshold=0.5))
+
+    assert len(hits) == 1
+
+
+def test_detect_calls_speech_probability_on_every_frame_regardless_of_gates() -> None:
+    """`speech_probability()` se llama en cada frame sin importar el resultado de las otras
+    gates (`system_audio`), mismo motivo que `model.predict()`: mantiene el buffer interno del
+    detector sincronizado con el audio real en vez de desalinearlo salteando frames."""
+    frames = _silence_frames(2)
+    model = _model_with([{"hey_jarvis": 0.9}, {"hey_jarvis": 0.9}])
+    fake_detector = _FakeSpeechDetector(probability=0.9)
+
+    hits = list(
+        detect(
+            frames,
+            model=model,
+            threshold=0.5,
+            system_audio=_FakeSystemAudioGate(loud=True),
+            speech_detector=fake_detector,
+        )
+    )
+
+    assert hits == []
+    assert fake_detector.calls == 2
